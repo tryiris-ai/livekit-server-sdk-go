@@ -60,7 +60,8 @@ type PCTransport struct {
 	onRemoteDescriptionSettled func() error
 	onRTTUpdate                func(rtt uint32)
 
-	OnOffer func(description webrtc.SessionDescription)
+	OnOffer            func(description webrtc.SessionDescription)
+	onNegotiationError func(err error)
 }
 
 type PCTransportParams struct {
@@ -70,6 +71,8 @@ type PCTransportParams struct {
 	Pacer                pacer.Factory
 	OnRTTUpdate          func(rtt uint32)
 	IsSender             bool
+
+	OnNegotiationError func(err error)
 }
 
 func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
@@ -95,6 +98,7 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 	t := &PCTransport{
 		debouncedNegotiate: debounce.New(negotiationFrequency),
 		onRTTUpdate:        params.OnRTTUpdate,
+		onNegotiationError: params.OnNegotiationError,
 	}
 
 	// nack interceptor
@@ -371,6 +375,7 @@ func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {
 	logger.Debugw("create offer", "offer", offer.SDP)
 	if err != nil {
 		logger.Errorw("could not negotiate", err)
+		t.onNegotiationError(err)
 		return err
 	}
 	if err := t.pc.SetLocalDescription(offer); err != nil {

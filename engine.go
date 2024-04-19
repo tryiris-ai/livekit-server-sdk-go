@@ -231,12 +231,14 @@ func (e *RTCEngine) configure(
 		Pacer:                e.connParams.Pacer,
 		OnRTTUpdate:          e.setRTT,
 		IsSender:             true,
+		OnNegotiationError:   e.handleNegiationError,
 	}); err != nil {
 		return err
 	}
 	if e.subscriber, err = NewPCTransport(PCTransportParams{
 		Configuration:        configuration,
 		RetransmitBufferSize: e.connParams.RetransmitBufferSize,
+		OnNegotiationError:   e.handleNegiationError,
 	}); err != nil {
 		return err
 	}
@@ -644,5 +646,13 @@ func (e *RTCEngine) handleLeave(leave *livekit.LeaveRequest) {
 		if e.OnDisconnected != nil {
 			e.OnDisconnected()
 		}
+	}
+}
+
+func (e *RTCEngine) handleNegiationError(err error) {
+	logger.Errorw("negotiation error", err)
+
+	if e.OnDisconnected != nil {
+		e.OnDisconnected()
 	}
 }
