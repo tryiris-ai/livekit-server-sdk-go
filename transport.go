@@ -31,7 +31,7 @@ import (
 	lkinterceptor "github.com/livekit/mediatransportutil/pkg/interceptor"
 	"github.com/livekit/mediatransportutil/pkg/pacer"
 	lksdp "github.com/livekit/protocol/sdp"
-	sdkinterceptor "github.com/livekit/server-sdk-go/v2/pkg/interceptor"
+	sdkinterceptor "github.com/tryiris-ai/livekit-server-sdk-go/v2/pkg/interceptor"
 )
 
 const (
@@ -374,12 +374,13 @@ func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {
 	offer, err := t.pc.CreateOffer(options)
 	logger.Debugw("create offer", "offer", offer.SDP)
 	if err != nil {
-		logger.Errorw("could not negotiate", err)
+		logger.Errorw("could not negotiate, notifiying...", err)
 		t.onNegotiationError(err)
 		return err
 	}
 	if err := t.pc.SetLocalDescription(offer); err != nil {
-		logger.Errorw("could not set local description", err)
+		logger.Errorw("could not set local description, notifiying...", err)
+		t.onNegotiationError(err)
 		return err
 	}
 	t.restartAfterGathering = false

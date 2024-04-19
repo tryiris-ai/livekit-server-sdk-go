@@ -648,11 +648,24 @@ func (e *RTCEngine) handleLeave(leave *livekit.LeaveRequest) {
 		}
 	}
 }
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+=======
+>>>>>>> Stashed changes
 
 func (e *RTCEngine) handleNegiationError(err error) {
 	logger.Errorw("negotiation error", err)
 
 	if e.OnDisconnected != nil {
+<<<<<<< Updated upstream
 		e.OnDisconnected()
 	}
 }
+=======
+		logger.Infow("negotiation error, sending disconnected event")
+		e.OnDisconnected()
+	}
+}
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
