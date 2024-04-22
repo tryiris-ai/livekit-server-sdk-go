@@ -151,7 +151,8 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 	i.Add(lkinterceptor.NewRTTFromXRFactory(onXRRtt))
 
 	se := webrtc.SettingEngine{}
-	se.SetSRTPProtectionProfiles(dtls.SRTP_AEAD_AES_128_GCM, dtls.SRTP_AES128_CM_HMAC_SHA1_80)
+	fmt.Println("Setting protection profiles", dtls.SRTP_AES128_CM_HMAC_SHA1_80)
+	se.SetSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80)
 	se.SetDTLSRetransmissionInterval(dtlsRetransmissionInterval)
 	se.SetICETimeouts(iceDisconnectedTimeout, iceFailedTimeout, iceKeepaliveInterval)
 
