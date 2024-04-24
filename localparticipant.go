@@ -119,7 +119,7 @@ func (p *LocalParticipant) PublishTrack(track webrtc.TrackLocal, opts *TrackPubl
 
 	publisher.Negotiate()
 
-	logger.Infow("published track", "name", opts.Name, "source", opts.Source.String())
+	logger.Infow("published track", "name", opts.Name, "source", opts.Source.String(), "trackID", pubRes.Track.Sid)
 
 	return pub, nil
 }
@@ -139,9 +139,12 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 		}
 	}
 
+	tracksCopy := make([]*LocalTrack, len(tracks))
+	copy(tracksCopy, tracks)
+
 	// tracks should be low to high
-	sort.Slice(tracks, func(i, j int) bool {
-		return tracks[i].videoLayer.Width < tracks[j].videoLayer.Width
+	sort.Slice(tracksCopy, func(i, j int) bool {
+		return tracksCopy[i].videoLayer.Width < tracksCopy[j].videoLayer.Width
 	})
 
 	if opts == nil {
@@ -152,13 +155,13 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 		opts.Source = livekit.TrackSource_CAMERA
 	}
 
-	mainTrack := tracks[len(tracks)-1]
+	mainTrack := tracksCopy[len(tracksCopy)-1]
 
 	pub := NewLocalTrackPublication(KindFromRTPType(mainTrack.Kind()), nil, *opts, p.engine.client)
 	pub.onMuteChanged = p.onTrackMuted
 
 	var layers []*livekit.VideoLayer
-	for _, st := range tracks {
+	for _, st := range tracksCopy {
 		layers = append(layers, st.videoLayer)
 	}
 	err := p.engine.client.SendRequest(&livekit.SignalRequest{
@@ -197,7 +200,7 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 	publishPC := publisher.PeerConnection()
 	var transceiver *webrtc.RTPTransceiver
 	var sender *webrtc.RTPSender
-	for idx, st := range tracks {
+	for idx, st := range tracksCopy {
 		if idx == 0 {
 			transceiver, err = publishPC.AddTransceiverFromTrack(st, webrtc.RTPTransceiverInit{
 				Direction: webrtc.RTPTransceiverDirectionSendonly,
@@ -221,7 +224,7 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 
 	publisher.Negotiate()
 
-	logger.Infow("published simulcast track", "name", opts.Name, "source", opts.Source.String())
+	logger.Infow("published simulcast track", "name", opts.Name, "source", opts.Source.String(), "trackID", pubRes.Track.Sid)
 
 	return pub, nil
 }
@@ -289,15 +292,11 @@ func (p *LocalParticipant) publishData(kind livekit.DataPacket_Kind, dataPacket 
 //
 // Messages are sent via a LOSSY channel by default, see WithDataPublishReliable for sending reliable data.
 //
-// Deprecated: Use PublishDataPacket with UserData instead. Note that it sends reliable packets by default.
+// Deprecated: Use PublishDataPacket with UserData instead.
 func (p *LocalParticipant) PublishData(payload []byte, opts ...DataPublishOption) error {
 	options := &dataPublishOptions{}
 	for _, opt := range opts {
 		opt(options)
-	}
-	if options.Reliable == nil {
-		// Old logic sends packets as lossy by default.
-		opts = append(opts, WithDataPublishReliable(false))
 	}
 	return p.PublishDataPacket(UserData(payload), opts...)
 }
@@ -342,7 +341,7 @@ func (p *UserDataPacket) ToProto() *livekit.DataPacket {
 // By default, the message can be received by all participants in a room,
 // see WithDataPublishDestination for choosing specific participants.
 //
-// Messages are sent via a RELIABLE channel, see WithDataPublishReliable for sending lossy data.
+// Messages are sent via UDP and offer no delivery guarantees, see WithDataPublishReliable for sending data reliably (with retries).
 func (p *LocalParticipant) PublishDataPacket(pck DataPacket, opts ...DataPublishOption) error {
 	options := &dataPublishOptions{}
 	for _, opt := range opts {
@@ -354,11 +353,11 @@ func (p *LocalParticipant) PublishDataPacket(pck DataPacket, opts ...DataPublish
 			u.User.Topic = proto.String(options.Topic)
 		}
 	}
-	// New logic sends packets as reliable by default.
+
 	// This matches the default value of Kind on protobuf level.
-	kind := livekit.DataPacket_RELIABLE
-	if options.Reliable != nil && !*options.Reliable {
-		kind = livekit.DataPacket_LOSSY
+	kind := livekit.DataPacket_LOSSY
+	if options.Reliable != nil && *options.Reliable {
+		kind = livekit.DataPacket_RELIABLE
 	}
 	//lint:ignore SA1019 backward compatibility
 	dataPacket.Kind = kind
@@ -401,6 +400,8 @@ func (p *LocalParticipant) UnpublishTrack(sid string) error {
 	}
 
 	pub.CloseTrack()
+
+	logger.Infow("unpublished track", "name", pub.Name(), "sid", sid)
 
 	return err
 }

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/dtls/v2"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -36,22 +37,23 @@ const (
 )
 
 type RTCEngine struct {
-	pclock                sync.Mutex
-	publisher             *PCTransport
-	subscriber            *PCTransport
-	client                *SignalClient
-	dclock                sync.RWMutex
-	reliableDC            *webrtc.DataChannel
-	lossyDC               *webrtc.DataChannel
-	reliableDCSub         *webrtc.DataChannel
-	lossyDCSub            *webrtc.DataChannel
-	trackPublishedChan    chan *livekit.TrackPublishedResponse
-	subscriberPrimary     bool
-	hasConnected          atomic.Bool
-	hasPublish            atomic.Bool
-	closed                atomic.Bool
-	reconnecting          atomic.Bool
-	requiresFullReconnect atomic.Bool
+	pclock                 sync.Mutex
+	publisher              *PCTransport
+	subscriber             *PCTransport
+	client                 *SignalClient
+	dclock                 sync.RWMutex
+	reliableDC             *webrtc.DataChannel
+	lossyDC                *webrtc.DataChannel
+	reliableDCSub          *webrtc.DataChannel
+	lossyDCSub             *webrtc.DataChannel
+	trackPublishedChan     chan *livekit.TrackPublishedResponse
+	subscriberPrimary      bool
+	hasConnected           atomic.Bool
+	hasPublish             atomic.Bool
+	closed                 atomic.Bool
+	reconnecting           atomic.Bool
+	requiresFullReconnect  atomic.Bool
+	srtpProtectionProfiles []dtls.SRTPProtectionProfile
 
 	url        string
 	token      atomic.String
@@ -60,7 +62,7 @@ type RTCEngine struct {
 	JoinTimeout time.Duration
 
 	// callbacks
-	OnDisconnected      func()
+	OnDisconnected      func(reason DisconnectionReason)
 	OnMediaTrack        func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)
 	OnParticipantUpdate func([]*livekit.ParticipantInfo)
 	OnSpeakersChanged   func([]*livekit.SpeakerInfo)
@@ -120,6 +122,7 @@ func (e *RTCEngine) Join(url string, token string, params *connectParams) (*live
 	e.url = url
 	e.token.Store(token)
 	e.connParams = params
+	e.srtpProtectionProfiles = params.SRTPProtectionProfiles
 
 	err = e.configure(res.IceServers, res.ClientConfiguration, proto.Bool(res.SubscriberPrimary))
 	if err != nil {
@@ -205,7 +208,10 @@ func (e *RTCEngine) configure(
 	clientConfig *livekit.ClientConfiguration,
 	subscriberPrimary *bool) error {
 	rtcICEServers := FromProtoIceServers(iceServers)
-	configuration := webrtc.Configuration{ICEServers: rtcICEServers}
+	configuration := webrtc.Configuration{
+		ICEServers:         rtcICEServers,
+		ICETransportPolicy: e.connParams.ICETransportPolicy,
+	}
 	if clientConfig != nil &&
 		clientConfig.GetForceRelay() == livekit.ClientConfigSetting_ENABLED {
 		configuration.ICETransportPolicy = webrtc.ICETransportPolicyRelay
@@ -226,12 +232,14 @@ func (e *RTCEngine) configure(
 
 	var err error
 	if e.publisher, err = NewPCTransport(PCTransportParams{
-		Configuration:        configuration,
-		RetransmitBufferSize: e.connParams.RetransmitBufferSize,
-		Pacer:                e.connParams.Pacer,
-		OnRTTUpdate:          e.setRTT,
-		IsSender:             true,
-		OnNegotiationError:   e.handleNegiationError,
+		Configuration:          configuration,
+		RetransmitBufferSize:   e.connParams.RetransmitBufferSize,
+		Pacer:                  e.connParams.Pacer,
+		Interceptors:           e.connParams.Interceptors,
+		OnRTTUpdate:            e.setRTT,
+		IsSender:               true,
+		OnNegotiationError:     e.handleNegiationError,
+		SRTPProtectionProfiles: e.srtpProtectionProfiles,
 	}); err != nil {
 		return err
 	}
@@ -561,7 +569,7 @@ func (e *RTCEngine) handleDisconnect(fullReconnect bool) {
 		}
 
 		if e.OnDisconnected != nil {
-			e.OnDisconnected()
+			e.OnDisconnected(Failed)
 		}
 	}()
 }
@@ -586,9 +594,11 @@ func (e *RTCEngine) resumeConnection() error {
 	publisher := e.publisher
 	e.pclock.Unlock()
 	if sendOffer {
-		publisher.createAndSendOffer(&webrtc.OfferOptions{
+		if err := publisher.createAndSendOffer(&webrtc.OfferOptions{
 			ICERestart: true,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	if err = e.waitUntilConnected(); err != nil {
@@ -644,7 +654,7 @@ func (e *RTCEngine) handleLeave(leave *livekit.LeaveRequest) {
 			"canReconnect", leave.GetCanReconnect(),
 		)
 		if e.OnDisconnected != nil {
-			e.OnDisconnected()
+			e.OnDisconnected(LeaveRequested)
 		}
 	}
 }
@@ -653,7 +663,6 @@ func (e *RTCEngine) handleNegiationError(err error) {
 	logger.Errorw("negotiation error", err)
 
 	if e.OnDisconnected != nil {
-		logger.Infow("negotiation error, sending disconnected event")
-		e.OnDisconnected()
+		e.OnDisconnected(NegotiationFailed)
 	}
 }
