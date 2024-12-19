@@ -17,6 +17,9 @@ package lksdk
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -181,7 +184,31 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 	}
 
 	se := webrtc.SettingEngine{}
-	se.SetSRTPProtectionProfiles(dtls.SRTP_AEAD_AES_128_GCM, dtls.SRTP_AES128_CM_HMAC_SHA1_80)
+
+	profiles := []dtls.SRTPProtectionProfile{}
+
+	envProfiles := os.Getenv("IRIS_SRTP_PROTECTION_PROFILES")
+
+	if envProfiles != "" {
+		cmp := strings.Split(envProfiles, ",")
+
+		for _, p := range cmp {
+			// parse p to int
+			i, err := strconv.Atoi(p)
+
+			if err != nil {
+				return nil, err
+			}
+
+			profiles = append(profiles, dtls.SRTPProtectionProfile(i))
+		}
+	} else {
+		profiles = append(profiles, dtls.SRTP_AEAD_AES_128_GCM)
+		profiles = append(profiles, dtls.SRTP_AES128_CM_HMAC_SHA1_80)
+	}
+
+	se.SetSRTPProtectionProfiles(profiles...)
+
 	se.SetDTLSRetransmissionInterval(dtlsRetransmissionInterval)
 	se.SetICETimeouts(iceDisconnectedTimeout, iceFailedTimeout, iceKeepaliveInterval)
 
