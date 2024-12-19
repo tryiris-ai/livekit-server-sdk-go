@@ -17,6 +17,7 @@ package lksdk
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -206,6 +207,8 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 		profiles = append(profiles, dtls.SRTP_AEAD_AES_128_GCM)
 		profiles = append(profiles, dtls.SRTP_AES128_CM_HMAC_SHA1_80)
 	}
+
+	slog.Info("SRTP Protection Profiles: ", "profiles", profiles)
 
 	se.SetSRTPProtectionProfiles(profiles...)
 
