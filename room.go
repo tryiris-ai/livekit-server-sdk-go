@@ -15,6 +15,7 @@
 package lksdk
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"strings"
@@ -188,6 +189,7 @@ func NewRoom(callback *RoomCallback) *Room {
 	r.LocalParticipant = newLocalParticipant(engine, r.callback)
 
 	// callbacks from engine
+	engine.OnSignalClientConnected = r.handleSignalClientConnected
 	engine.OnMediaTrack = r.handleMediaTrack
 	engine.OnDisconnected = r.handleDisconnect
 	engine.OnParticipantUpdate = r.handleParticipantUpdate
@@ -288,6 +290,8 @@ func (r *Room) Join(url string, info ConnectInfo, opts ...ConnectOption) error {
 
 // JoinWithToken - customize participant options by generating your own token
 func (r *Room) JoinWithToken(url, token string, opts ...ConnectOption) error {
+	ctx := context.TODO()
+
 	params := &SignalClientConnectParams{
 		AutoSubscribe: true,
 	}
@@ -311,12 +315,21 @@ func (r *Room) JoinWithToken(url, token string, opts ...ConnectOption) error {
 				logger.Debugw("RTC engine joining room",
 					"url", bestURL,
 				)
-				joinRes, err = r.engine.Join(bestURL, token, params)
+				// Not exposing this timeout as an option for now so that callers don't
+				// set unrealistic values.  We may reconsider in the future though.
+				// 4 seconds chosen to balance the trade-offs:
+				// - Too long, users will given up.
+				// - Too short, risk frequently timing out on a request that would have
+				//   succeeded.
+				callCtx, cancelCallCtx := context.WithTimeout(ctx, 4*time.Second)
+				joinRes, err = r.engine.JoinContext(callCtx, bestURL, token, params)
+				cancelCallCtx()
 				if err != nil {
 					// try the next URL with exponential backoff
 					d := time.Duration(1<<min(tries, 6)) * time.Second // max 64 seconds
 					logger.Errorw("failed to join room", err,
 						"retrying in", d,
+						"url", bestURL,
 					)
 					time.Sleep(d)
 					continue
@@ -327,30 +340,10 @@ func (r *Room) JoinWithToken(url, token string, opts ...ConnectOption) error {
 
 	if joinRes == nil {
 		var err error
-		joinRes, err = r.engine.Join(url, token, params)
+		_, err = r.engine.JoinContext(ctx, url, token, params)
 		if err != nil {
 			return err
 		}
-	}
-
-	r.lock.Lock()
-	r.name = joinRes.Room.Name
-	r.metadata = joinRes.Room.Metadata
-	r.serverInfo = joinRes.ServerInfo
-	r.connectionState = ConnectionStateConnected
-	r.sifTrailer = make([]byte, len(joinRes.SifTrailer))
-	copy(r.sifTrailer, joinRes.SifTrailer)
-	r.lock.Unlock()
-
-	r.setSid(joinRes.Room.Sid, false)
-
-	r.LocalParticipant.updateInfo(joinRes.Participant)
-	r.LocalParticipant.updateSubscriptionPermission()
-
-	for _, pi := range joinRes.OtherParticipants {
-		rp := r.addRemoteParticipant(pi, true)
-		r.clearParticipantDefers(livekit.ParticipantID(pi.Sid), pi)
-		r.runParticipantDefers(livekit.ParticipantID(pi.Sid), rp)
 	}
 
 	return nil
@@ -394,7 +387,12 @@ func (r *Room) runParticipantDefers(sid livekit.ParticipantID, p *RemoteParticip
 	r.lock.Unlock()
 
 	if len(fncs) != 0 {
-		r.log.Infow("running deferred updates for participant", "participantID", sid, "updates", len(fncs))
+		r.log.Infow(
+			"running deferred updates for participant",
+			"participant", p.Identity(),
+			"pID", sid,
+			"numUpdates", len(fncs),
+		)
 		for _, fnc := range fncs {
 			fnc(p)
 		}
@@ -414,7 +412,12 @@ func (r *Room) clearParticipantDefers(sid livekit.ParticipantID, pi *livekit.Par
 			}
 		}
 		if !found {
-			r.log.Infow("deleting deferred update for participant", "participantID", sid, "trackID", trackID)
+			r.log.Infow(
+				"deleting deferred update for participant",
+				"participant", pi.Identity,
+				"pID", sid,
+				"trackID", trackID,
+			)
 			delete(r.sidDefers[sid], trackID)
 			if len(r.sidDefers[sid]) == 0 {
 				delete(r.sidDefers, sid)
@@ -520,7 +523,7 @@ func (r *Room) handleMediaTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPR
 	if rp == nil {
 		r.log.Infow(
 			"could not find participant, deferring track update",
-			"participantID", participantID,
+			"pID", participantID,
 			"trackID", trackID,
 			"streamID", streamID,
 		)
@@ -529,6 +532,28 @@ func (r *Room) handleMediaTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPR
 	}
 	update(rp)
 	r.runParticipantDefers(livekit.ParticipantID(participantID), rp)
+}
+
+func (r *Room) handleSignalClientConnected(joinRes *livekit.JoinResponse) {
+	r.lock.Lock()
+	r.name = joinRes.Room.Name
+	r.metadata = joinRes.Room.Metadata
+	r.serverInfo = joinRes.ServerInfo
+	r.connectionState = ConnectionStateConnected
+	r.sifTrailer = make([]byte, len(joinRes.SifTrailer))
+	copy(r.sifTrailer, joinRes.SifTrailer)
+	r.lock.Unlock()
+
+	r.setSid(joinRes.Room.Sid, false)
+
+	r.LocalParticipant.updateInfo(joinRes.Participant)
+	r.LocalParticipant.updateSubscriptionPermission()
+
+	for _, pi := range joinRes.OtherParticipants {
+		r.addRemoteParticipant(pi, true)
+		r.clearParticipantDefers(livekit.ParticipantID(pi.Sid), pi)
+		// no need to run participant defers here, since we are connected for the first time
+	}
 }
 
 func (r *Room) handleDisconnect(reason DisconnectionReason) {
@@ -608,10 +633,7 @@ func (r *Room) handleParticipantUpdate(participants []*livekit.ParticipantInfo) 
 		isNew := rp == nil
 
 		if pi.State == livekit.ParticipantInfo_DISCONNECTED {
-			// remove
-			if rp != nil {
-				r.handleParticipantDisconnect(rp)
-			}
+			r.handleParticipantDisconnect(rp)
 		} else if isNew {
 			rp = r.addRemoteParticipant(pi, true)
 			r.clearParticipantDefers(livekit.ParticipantID(pi.Sid), pi)
@@ -622,8 +644,14 @@ func (r *Room) handleParticipantUpdate(participants []*livekit.ParticipantInfo) 
 			rp.updateInfo(pi)
 			newSid := livekit.ParticipantID(rp.SID())
 			if oldSid != newSid {
-				r.log.Infow("participant sid update", "sid-old", oldSid, "sid-new", newSid, "identity", rp.Identity())
+				r.log.Infow(
+					"participant sid update",
+					"participant", rp.Identity(),
+					"sid-old", oldSid,
+					"sid-new", newSid,
+				)
 				r.lock.Lock()
+				delete(r.sidDefers, oldSid)
 				delete(r.sidToIdentity, oldSid)
 				r.sidToIdentity[newSid] = livekit.ParticipantIdentity(rp.Identity())
 				r.lock.Unlock()
@@ -634,15 +662,19 @@ func (r *Room) handleParticipantUpdate(participants []*livekit.ParticipantInfo) 
 	}
 }
 
-func (r *Room) handleParticipantDisconnect(p *RemoteParticipant) {
+func (r *Room) handleParticipantDisconnect(rp *RemoteParticipant) {
+	if rp == nil {
+		return
+	}
+
 	r.lock.Lock()
-	delete(r.remoteParticipants, livekit.ParticipantIdentity(p.Identity()))
-	delete(r.sidToIdentity, livekit.ParticipantID(p.SID()))
-	delete(r.sidDefers, livekit.ParticipantID(p.SID()))
+	delete(r.remoteParticipants, livekit.ParticipantIdentity(rp.Identity()))
+	delete(r.sidToIdentity, livekit.ParticipantID(rp.SID()))
+	delete(r.sidDefers, livekit.ParticipantID(rp.SID()))
 	r.lock.Unlock()
 
-	p.unpublishAllTracks()
-	go r.callback.OnParticipantDisconnected(p)
+	rp.unpublishAllTracks()
+	go r.callback.OnParticipantDisconnected(rp)
 }
 
 func (r *Room) handleSpeakersChange(speakerUpdates []*livekit.SpeakerInfo) {
@@ -739,6 +771,10 @@ func (r *Room) handleTranscriptionReceived(transcription *livekit.Transcription)
 		publication = r.LocalParticipant.getPublication(transcription.TrackId)
 	} else {
 		rp := r.GetParticipantByIdentity(transcription.TranscribedParticipantIdentity)
+		if rp == nil {
+			r.log.Debugw("recieved transcription for unknown participant", "participant", transcription.TranscribedParticipantIdentity)
+			return
+		}
 		publication = rp.getPublication(transcription.TrackId)
 		p = rp
 	}

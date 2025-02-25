@@ -18,8 +18,10 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/utils/xtwirp"
 	"github.com/twitchtv/twirp"
 )
 
@@ -29,6 +31,7 @@ type RoomServiceClient struct {
 }
 
 func NewRoomServiceClient(url string, apiKey string, secretKey string, opts ...twirp.ClientOption) *RoomServiceClient {
+	opts = append(opts, xtwirp.DefaultClientOptions()...)
 	url = ToHttpURL(url)
 	client := livekit.NewRoomServiceProtobufClient(url, &http.Client{}, opts...)
 	return &RoomServiceClient{
@@ -131,6 +134,11 @@ func (c *RoomServiceClient) SendData(ctx context.Context, req *livekit.SendDataR
 	ctx, err := c.withAuth(ctx, withVideoGrant{RoomAdmin: true, Room: req.Room})
 	if err != nil {
 		return nil, err
+	}
+	// add a nonce to enable receiver to de-dupe
+	bytes, err := uuid.New().MarshalBinary()
+	if err == nil {
+		req.Nonce = bytes
 	}
 	return c.roomService.SendData(ctx, req)
 }
