@@ -12,23 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package jitter
+package signalling
 
-import "github.com/livekit/protocol/logger"
+import "errors"
 
-type Option func(b *Buffer)
-
-// WithPacketDroppedHandler sets a callback that's called when a packet
-// is dropped. This signifies packet loss.
-func WithPacketDroppedHandler(f func()) Option {
-	return func(b *Buffer) {
-		b.onPacketDropped = f
-	}
-}
-
-// WithLogger sets a logger which will log packets dropped
-func WithLogger(l logger.Logger) Option {
-	return func(b *Buffer) {
-		b.logger = l
-	}
-}
+var (
+	ErrUnimplemented      = errors.New("unimplemented")
+	ErrURLNotProvided     = errors.New("URL was not provided")
+	ErrInvalidMessageType = errors.New("invalid message type")
+	ErrInvalidParameter   = errors.New("invalid parameter")
+	ErrCannotDialSignal   = errors.New("could not dial signal connection")
+)

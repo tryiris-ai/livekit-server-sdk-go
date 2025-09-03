@@ -19,11 +19,12 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/twitchtv/twirp"
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/utils/xtwirp"
-	"github.com/twitchtv/twirp"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
+	"github.com/livekit/server-sdk-go/v2/signalling"
 )
 
 //lint:file-ignore SA1019 We still support some deprecated functions for backward compatibility
@@ -37,7 +38,7 @@ type SIPClient struct {
 func NewSIPClient(url string, apiKey string, secretKey string, opts ...twirp.ClientOption) *SIPClient {
 	opts = append(opts, xtwirp.DefaultClientOptions()...)
 	return &SIPClient{
-		sipClient: livekit.NewSIPProtobufClient(ToHttpURL(url), &http.Client{}, opts...),
+		sipClient: livekit.NewSIPProtobufClient(signalling.ToHttpURL(url), &http.Client{}, opts...),
 		authBase: authBase{
 			apiKey:    apiKey,
 			apiSecret: secretKey,
@@ -69,6 +70,32 @@ func (s *SIPClient) CreateSIPOutboundTrunk(ctx context.Context, in *livekit.Crea
 		return nil, err
 	}
 	return s.sipClient.CreateSIPOutboundTrunk(ctx, in)
+}
+
+// UpdateSIPInboundTrunk updates an existing SIP Inbound Trunk.
+func (s *SIPClient) UpdateSIPInboundTrunk(ctx context.Context, in *livekit.UpdateSIPInboundTrunkRequest) (*livekit.SIPInboundTrunkInfo, error) {
+	if in == nil || in.Action == nil || in.SipTrunkId == "" {
+		return nil, ErrInvalidParameter
+	}
+
+	ctx, err := s.withAuth(ctx, withSIPGrant{Admin: true})
+	if err != nil {
+		return nil, err
+	}
+	return s.sipClient.UpdateSIPInboundTrunk(ctx, in)
+}
+
+// UpdateSIPOutboundTrunk updates an existing SIP Outbound Trunk.
+func (s *SIPClient) UpdateSIPOutboundTrunk(ctx context.Context, in *livekit.UpdateSIPOutboundTrunkRequest) (*livekit.SIPOutboundTrunkInfo, error) {
+	if in == nil || in.Action == nil || in.SipTrunkId == "" {
+		return nil, ErrInvalidParameter
+	}
+
+	ctx, err := s.withAuth(ctx, withSIPGrant{Admin: true})
+	if err != nil {
+		return nil, err
+	}
+	return s.sipClient.UpdateSIPOutboundTrunk(ctx, in)
 }
 
 // GetSIPInboundTrunksByIDs gets SIP Inbound Trunks by ID.
@@ -182,6 +209,19 @@ func (s *SIPClient) CreateSIPDispatchRule(ctx context.Context, in *livekit.Creat
 	return s.sipClient.CreateSIPDispatchRule(ctx, in)
 }
 
+// UpdateSIPDispatchRule updates an existing SIP Dispatch Rule.
+func (s *SIPClient) UpdateSIPDispatchRule(ctx context.Context, in *livekit.UpdateSIPDispatchRuleRequest) (*livekit.SIPDispatchRuleInfo, error) {
+	if in == nil || in.Action == nil || in.SipDispatchRuleId == "" {
+		return nil, ErrInvalidParameter
+	}
+
+	ctx, err := s.withAuth(ctx, withSIPGrant{Admin: true})
+	if err != nil {
+		return nil, err
+	}
+	return s.sipClient.UpdateSIPDispatchRule(ctx, in)
+}
+
 // GetSIPDispatchRulesByIDs gets SIP Dispatch Rules by ID.
 // Returned slice is in the same order as the IDs. Missing IDs will have nil in the corresponding position.
 func (s *SIPClient) GetSIPDispatchRulesByIDs(ctx context.Context, ids []string) ([]*livekit.SIPDispatchRuleInfo, error) {
@@ -276,14 +316,5 @@ func (s *SIPClient) TransferSIPParticipant(ctx context.Context, in *livekit.Tran
 
 // SIPStatusFrom unwraps an error and returns associated SIP call status, if any.
 func SIPStatusFrom(err error) *livekit.SIPStatus {
-	st, ok := status.FromError(err)
-	if !ok {
-		return nil
-	}
-	for _, d := range st.Details() {
-		if e, ok := d.(*livekit.SIPStatus); ok {
-			return e
-		}
-	}
-	return nil
+	return livekit.SIPStatusFrom(err)
 }
