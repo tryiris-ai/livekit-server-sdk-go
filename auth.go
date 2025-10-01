@@ -16,10 +16,11 @@ package lksdk
 
 import (
 	"context"
-	"net/http"
+
+	"github.com/twitchtv/twirp"
 
 	"github.com/livekit/protocol/auth"
-	"github.com/twitchtv/twirp"
+	"github.com/livekit/server-sdk-go/v2/signalling"
 )
 
 type authBase struct {
@@ -43,6 +44,12 @@ func (g withSIPGrant) Apply(t *auth.AccessToken) {
 	t.SetSIPGrant((*auth.SIPGrant)(&g))
 }
 
+type withAgentGrant auth.AgentGrant
+
+func (g withAgentGrant) Apply(t *auth.AccessToken) {
+	t.SetAgentGrant((*auth.AgentGrant)(&g))
+}
+
 func (b authBase) withAuth(ctx context.Context, opt authOption, options ...authOption) (context.Context, error) {
 	at := auth.NewAccessToken(b.apiKey, b.apiSecret)
 	opt.Apply(at)
@@ -54,11 +61,5 @@ func (b authBase) withAuth(ctx context.Context, opt authOption, options ...authO
 		return nil, err
 	}
 
-	return twirp.WithHTTPRequestHeaders(ctx, newHeaderWithToken(token))
-}
-
-func newHeaderWithToken(token string) http.Header {
-	header := make(http.Header)
-	header.Set("Authorization", "Bearer "+token)
-	return header
+	return twirp.WithHTTPRequestHeaders(ctx, signalling.NewHTTPHeaderWithToken(token))
 }

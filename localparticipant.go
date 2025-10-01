@@ -15,9 +15,14 @@
 package lksdk
 
 import (
+	"mime"
+	"os"
+	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/proto"
 
@@ -32,12 +37,19 @@ type LocalParticipant struct {
 	baseParticipant
 	engine                 *RTCEngine
 	subscriptionPermission *livekit.SubscriptionPermission
+	serverInfo             *livekit.ServerInfo
+
+	rpcPendingAcks      *sync.Map
+	rpcPendingResponses *sync.Map
 }
 
-func newLocalParticipant(engine *RTCEngine, roomcallback *RoomCallback) *LocalParticipant {
+func newLocalParticipant(engine *RTCEngine, roomcallback *RoomCallback, serverInfo *livekit.ServerInfo) *LocalParticipant {
 	return &LocalParticipant{
-		baseParticipant: *newBaseParticipant(roomcallback),
-		engine:          engine,
+		baseParticipant:     *newBaseParticipant(roomcallback),
+		engine:              engine,
+		serverInfo:          serverInfo,
+		rpcPendingAcks:      &sync.Map{},
+		rpcPendingResponses: &sync.Map{},
 	}
 }
 
@@ -55,8 +67,8 @@ func (p *LocalParticipant) PublishTrack(track webrtc.TrackLocal, opts *TrackPubl
 		}
 	}
 
-	publisher, ok := p.engine.Publisher()
-	if !ok {
+	transport := p.getPublishTransport()
+	if transport == nil {
 		return nil, ErrNoPeerConnection
 	}
 
@@ -64,8 +76,22 @@ func (p *LocalParticipant) PublishTrack(track webrtc.TrackLocal, opts *TrackPubl
 	p.engine.RegisterTrackPublishedListener(track.ID(), pubChan)
 	defer p.engine.UnregisterTrackPublishedListener(track.ID())
 
-	pub := NewLocalTrackPublication(kind, track, *opts, p.engine.client)
+	pub := NewLocalTrackPublication(kind, track, *opts, p.engine)
 	pub.onMuteChanged = p.onTrackMuted
+
+	// add transceivers - re-use if possible, AddTrack will try to re-use.
+	// NOTE: `AddTrack` technically cannot re-use transceiver if it was ever
+	// used to send media, i. e. if it was ever in a `sendrecv` or `sendonly`
+	// direction. But, pion does not enforce that based on browser behaviour
+	// observed in practice.
+	sender, err := transport.PeerConnection().AddTrack(track)
+	if err != nil {
+		return nil, err
+	}
+
+	// LocalTrack will consume rtcp packets so we don't need to consume again
+	_, isSampleTrack := track.(*LocalTrack)
+	pub.setSender(sender, !isSampleTrack)
 
 	req := &livekit.AddTrackRequest{
 		Cid:        track.ID(),
@@ -89,30 +115,11 @@ func (p *LocalParticipant) PublishTrack(track webrtc.TrackLocal, opts *TrackPubl
 			},
 		}
 	}
-	err := p.engine.client.SendRequest(&livekit.SignalRequest{
-		Message: &livekit.SignalRequest_AddTrack{
-			AddTrack: req,
-		},
-	})
-	if err != nil {
+	if err := p.engine.SendAddTrack(req); err != nil {
 		return nil, err
 	}
 
-	// add transceivers - re-use if possible, AddTrack will try to re-use.
-	// NOTE: `AddTrack` technically cannot re-use transceiver if it was ever
-	// used to send media, i. e. if it was ever in a `sendrecv` or `sendonly`
-	// direction. But, pion does not enforce that based on browser behaviour
-	// observed in practice.
-	sender, err := publisher.PeerConnection().AddTrack(track)
-	if err != nil {
-		return nil, err
-	}
-
-	// LocalTrack will consume rtcp packets so we don't need to consume again
-	_, isSampleTrack := track.(*LocalTrack)
-	pub.setSender(sender, !isSampleTrack)
-
-	publisher.Negotiate()
+	transport.Negotiate()
 
 	var pubRes *livekit.TrackPublishedResponse
 	select {
@@ -169,53 +176,21 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 	p.engine.RegisterTrackPublishedListener(mainTrack.ID(), pubChan)
 	defer p.engine.UnregisterTrackPublishedListener(mainTrack.ID())
 
-	pub := NewLocalTrackPublication(KindFromRTPType(mainTrack.Kind()), nil, *opts, p.engine.client)
+	pub := NewLocalTrackPublication(KindFromRTPType(mainTrack.Kind()), nil, *opts, p.engine)
 	pub.onMuteChanged = p.onTrackMuted
 
-	var layers []*livekit.VideoLayer
-	for _, st := range tracksCopy {
-		layers = append(layers, st.videoLayer)
-	}
-	err := p.engine.client.SendRequest(&livekit.SignalRequest{
-		Message: &livekit.SignalRequest_AddTrack{
-			AddTrack: &livekit.AddTrackRequest{
-				Cid:    mainTrack.ID(),
-				Name:   opts.Name,
-				Source: opts.Source,
-				Type:   pub.Kind().ProtoType(),
-				Width:  mainTrack.videoLayer.Width,
-				Height: mainTrack.videoLayer.Height,
-				Layers: layers,
-				SimulcastCodecs: []*livekit.SimulcastCodec{
-					{
-						Codec: mainTrack.Codec().MimeType,
-						Cid:   mainTrack.ID(),
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var pubRes *livekit.TrackPublishedResponse
-	select {
-	case pubRes = <-pubChan:
-		break
-	case <-time.After(trackPublishTimeout):
-		return nil, ErrTrackPublishTimeout
-	}
-
-	publisher, ok := p.engine.Publisher()
-	if !ok {
+	transport := p.getPublishTransport()
+	if transport == nil {
 		return nil, ErrNoPeerConnection
 	}
 
 	// add transceivers
-	publishPC := publisher.PeerConnection()
-	var transceiver *webrtc.RTPTransceiver
-	var sender *webrtc.RTPSender
+	var (
+		transceiver *webrtc.RTPTransceiver
+		sender      *webrtc.RTPSender
+		err         error
+	)
+	pc := transport.PeerConnection()
 	for idx, st := range tracksCopy {
 		if idx == 0 {
 			// add transceivers - re-use if possible, AddTrack will try to re-use.
@@ -223,13 +198,13 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 			// used to send media, i. e. if it was ever in a `sendrecv` or `sendonly`
 			// direction. But, pion does not enforce that based on browser behaviour
 			// observed in practice.
-			sender, err = publishPC.AddTrack(st)
+			sender, err = pc.AddTrack(st)
 			if err != nil {
 				return nil, err
 			}
 
 			// as there is no way to get transceiver from sender, search
-			for _, tr := range publishPC.GetTransceivers() {
+			for _, tr := range pc.GetTransceivers() {
 				if tr.Sender() == sender {
 					transceiver = tr
 					break
@@ -246,10 +221,43 @@ func (p *LocalParticipant) PublishSimulcastTrack(tracks []*LocalTrack, opts *Tra
 		st.SetTransceiver(transceiver)
 	}
 
+	var layers []*livekit.VideoLayer
+	for _, st := range tracksCopy {
+		layers = append(layers, st.videoLayer)
+	}
+	err = p.engine.SendAddTrack(
+		&livekit.AddTrackRequest{
+			Cid:    mainTrack.ID(),
+			Name:   opts.Name,
+			Source: opts.Source,
+			Type:   pub.Kind().ProtoType(),
+			Width:  mainTrack.videoLayer.Width,
+			Height: mainTrack.videoLayer.Height,
+			Layers: layers,
+			SimulcastCodecs: []*livekit.SimulcastCodec{
+				{
+					Codec: mainTrack.Codec().MimeType,
+					Cid:   mainTrack.ID(),
+				},
+			},
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var pubRes *livekit.TrackPublishedResponse
+	select {
+	case pubRes = <-pubChan:
+		break
+	case <-time.After(trackPublishTimeout):
+		return nil, ErrTrackPublishTimeout
+	}
+
 	pub.updateInfo(pubRes.Track)
 	p.addPublication(pub)
 
-	publisher.Negotiate()
+	transport.Negotiate()
 
 	p.Callback.OnLocalTrackPublished(pub, p)
 	p.roomCallback.OnLocalTrackPublished(pub, p)
@@ -313,19 +321,6 @@ func (p *LocalParticipant) closeTracks() {
 	}
 }
 
-func (p *LocalParticipant) publishData(kind livekit.DataPacket_Kind, dataPacket *livekit.DataPacket) error {
-	if err := p.engine.ensurePublisherConnected(true); err != nil {
-		return err
-	}
-
-	encoded, err := proto.Marshal(dataPacket)
-	if err != nil {
-		return err
-	}
-
-	return p.engine.GetDataChannel(kind).Send(encoded)
-}
-
 // PublishData sends custom user data via WebRTC data channel.
 //
 // By default, the message can be received by all participants in a room,
@@ -365,8 +360,6 @@ func (p *LocalParticipant) PublishDataPacket(pck DataPacket, opts ...DataPublish
 	if options.Reliable != nil && *options.Reliable {
 		kind = livekit.DataPacket_RELIABLE
 	}
-	//lint:ignore SA1019 backward compatibility
-	dataPacket.Kind = kind
 
 	dataPacket.DestinationIdentities = options.DestinationIdentities
 	if u, ok := dataPacket.Value.(*livekit.DataPacket_User); ok && u.User != nil {
@@ -374,7 +367,7 @@ func (p *LocalParticipant) PublishDataPacket(pck DataPacket, opts ...DataPublish
 		u.User.DestinationIdentities = options.DestinationIdentities
 	}
 
-	return p.publishData(kind, dataPacket)
+	return p.engine.publishDataPacket(dataPacket, kind)
 }
 
 func (p *LocalParticipant) UnpublishTrack(sid string) error {
@@ -392,17 +385,17 @@ func (p *LocalParticipant) UnpublishTrack(sid string) error {
 
 	var err error
 	if localTrack, ok := pub.track.(webrtc.TrackLocal); ok {
-		publisher, ok := p.engine.Publisher()
-		if !ok {
+		transport := p.getPublishTransport()
+		if transport == nil {
 			return ErrNoPeerConnection
 		}
-		for _, sender := range publisher.pc.GetSenders() {
+		for _, sender := range transport.pc.GetSenders() {
 			if sender.Track() == localTrack {
-				err = publisher.pc.RemoveTrack(sender)
+				err = transport.pc.RemoveTrack(sender)
 				break
 			}
 		}
-		publisher.Negotiate()
+		transport.Negotiate()
 	}
 
 	pub.CloseTrack()
@@ -436,7 +429,7 @@ func (p *LocalParticipant) GetPublisherPeerConnection() *webrtc.PeerConnection {
 // SetName sets the name of the current participant.
 // updates will be performed only if the participant has canUpdateOwnMetadata grant
 func (p *LocalParticipant) SetName(name string) {
-	_ = p.engine.client.SendUpdateParticipantMetadata(&livekit.UpdateParticipantMetadata{
+	_ = p.engine.SendUpdateParticipantMetadata(&livekit.UpdateParticipantMetadata{
 		Name: name,
 	})
 }
@@ -444,7 +437,7 @@ func (p *LocalParticipant) SetName(name string) {
 // SetMetadata sets the metadata of the current participant.
 // Updates will be performed only if the participant has canUpdateOwnMetadata grant.
 func (p *LocalParticipant) SetMetadata(metadata string) {
-	_ = p.engine.client.SendUpdateParticipantMetadata(&livekit.UpdateParticipantMetadata{
+	_ = p.engine.SendUpdateParticipantMetadata(&livekit.UpdateParticipantMetadata{
 		Metadata: metadata,
 	})
 }
@@ -453,7 +446,7 @@ func (p *LocalParticipant) SetMetadata(metadata string) {
 // To remove an attribute, set it to empty value.
 // Updates will be performed only if the participant has canUpdateOwnMetadata grant.
 func (p *LocalParticipant) SetAttributes(attrs map[string]string) {
-	_ = p.engine.client.SendUpdateParticipantMetadata(&livekit.UpdateParticipantMetadata{
+	_ = p.engine.SendUpdateParticipantMetadata(&livekit.UpdateParticipantMetadata{
 		Attributes: attrs,
 	})
 }
@@ -468,7 +461,7 @@ func (p *LocalParticipant) updateInfo(info *livekit.ParticipantInfo) {
 			continue
 		}
 		if pub.IsMuted() != ti.Muted {
-			_ = p.engine.client.SendMuteTrack(pub.SID(), pub.IsMuted())
+			_ = p.engine.SendMuteTrack(pub.SID(), pub.IsMuted())
 		}
 	}
 }
@@ -518,16 +511,363 @@ func (p *LocalParticipant) updateSubscriptionPermissionLocked() {
 		return
 	}
 
-	err := p.engine.client.SendRequest(&livekit.SignalRequest{
-		Message: &livekit.SignalRequest_SubscriptionPermission{
-			SubscriptionPermission: p.subscriptionPermission,
-		},
-	})
-	if err != nil {
+	if err := p.engine.SendSubscriptionPermission(p.subscriptionPermission); err != nil {
 		logger.Errorw(
 			"could not send subscription permission", err,
 			"participant", p.identity,
 			"pID", p.sid,
 		)
 	}
+}
+
+func (p *LocalParticipant) handleParticipantDisconnected(identity string) {
+	p.rpcPendingAcks.Range(func(key, value interface{}) bool {
+		if value.(rpcPendingAckHandler).participantIdentity == identity {
+			p.rpcPendingAcks.Delete(key)
+		}
+		return true
+	})
+
+	p.rpcPendingResponses.Range(func(key, value interface{}) bool {
+		if value.(rpcPendingResponseHandler).participantIdentity == identity {
+			value, ok := p.rpcPendingResponses.LoadAndDelete(key)
+			if ok {
+				value.(rpcPendingResponseHandler).resolve(nil, rpcErrorFromBuiltInCodes(RpcRecipientDisconnected, nil))
+			}
+		}
+		return true
+	})
+}
+
+func (p *LocalParticipant) HandleIncomingRpcAck(requestId string) {
+	handler, ok := p.rpcPendingAcks.Load(requestId)
+	if !ok {
+		p.engine.log.Errorw("ack received for unexpected RPC request", nil, "requestId", requestId)
+	} else {
+		handler.(rpcPendingAckHandler).resolve()
+		p.rpcPendingAcks.Delete(requestId)
+	}
+}
+
+func (p *LocalParticipant) HandleIncomingRpcResponse(requestId string, payload *string, error *RpcError) {
+	handler, ok := p.rpcPendingResponses.Load(requestId)
+	if !ok {
+		p.engine.log.Errorw("response received for unexpected RPC request", nil, "requestId", requestId)
+	} else {
+		handler.(rpcPendingResponseHandler).resolve(payload, error)
+		p.rpcPendingResponses.Delete(requestId)
+	}
+}
+
+// Initiate an RPC call to a remote participant
+//   - @param params - For parameters for initiating the RPC call, see PerformRpcParams
+//   - @returns A string payload or an error
+func (p *LocalParticipant) PerformRpc(params PerformRpcParams) (*string, error) {
+	responseTimeout := 10000 * time.Millisecond
+	if params.ResponseTimeout != nil {
+		responseTimeout = *params.ResponseTimeout
+	}
+
+	resultChan := make(chan *string, 1)
+	errorChan := make(chan error, 1)
+
+	maxRoundTripLatency := 2000 * time.Millisecond
+
+	go func() {
+		if byteLength(params.Payload) > MaxPayloadBytes {
+			errorChan <- rpcErrorFromBuiltInCodes(RpcRequestPayloadTooLarge, nil)
+			return
+		}
+
+		if p.serverInfo != nil && compareVersions(p.serverInfo.Version, "1.8.0") < 0 {
+			errorChan <- rpcErrorFromBuiltInCodes(RpcUnsupportedServer, nil)
+			return
+		}
+
+		id := uuid.New().String()
+		p.engine.publishRpcRequest(params.DestinationIdentity, id, params.Method, params.Payload, responseTimeout-maxRoundTripLatency)
+
+		responseTimer := time.AfterFunc(responseTimeout, func() {
+			p.rpcPendingResponses.Delete(id)
+
+			select {
+			case errorChan <- rpcErrorFromBuiltInCodes(RpcResponseTimeout, nil):
+			default:
+			}
+		})
+
+		ackTimer := time.AfterFunc(maxRoundTripLatency, func() {
+			p.rpcPendingAcks.Delete(id)
+			p.rpcPendingResponses.Delete(id)
+			responseTimer.Stop()
+
+			select {
+			case errorChan <- rpcErrorFromBuiltInCodes(RpcConnectionTimeout, nil):
+			default:
+			}
+		})
+
+		p.rpcPendingAcks.Store(id, rpcPendingAckHandler{
+			resolve: func() {
+				ackTimer.Stop()
+			},
+			participantIdentity: params.DestinationIdentity,
+		})
+
+		p.rpcPendingResponses.Store(id, rpcPendingResponseHandler{
+			resolve: func(payload *string, error *RpcError) {
+				responseTimer.Stop()
+				if _, ok := p.rpcPendingAcks.Load(id); ok {
+					p.engine.log.Warnw("RPC response received before ack", nil, "requestId", id)
+					p.rpcPendingAcks.Delete(id)
+					ackTimer.Stop()
+				}
+
+				if error != nil {
+					errorChan <- error
+				} else {
+					if payload != nil {
+						resultChan <- payload
+					} else {
+						emptyStr := ""
+						resultChan <- &emptyStr
+					}
+				}
+			},
+			participantIdentity: params.DestinationIdentity,
+		})
+	}()
+
+	select {
+	case result := <-resultChan:
+		return result, nil
+	case err := <-errorChan:
+		return nil, err
+	}
+}
+
+func (p *LocalParticipant) cleanup() {
+	p.rpcPendingAcks.Clear()
+	p.rpcPendingResponses.Clear()
+}
+
+// StreamText creates a new text stream writer with the provided options.
+func (p *LocalParticipant) StreamText(options StreamTextOptions) *TextStreamWriter {
+	if options.StreamId == nil {
+		streamId := uuid.New().String()
+		options.StreamId = &streamId
+	}
+
+	if options.Attributes == nil {
+		options.Attributes = make(map[string]string)
+	}
+
+	var totalSize *uint64
+	if options.TotalSize != 0 {
+		totalSize = &options.TotalSize
+	}
+
+	info := TextStreamInfo{
+		baseStreamInfo: &baseStreamInfo{
+			Id:         *options.StreamId,
+			MimeType:   "text/plain",
+			Topic:      options.Topic,
+			Timestamp:  time.Now().UnixMilli(),
+			Size:       totalSize,
+			Attributes: options.Attributes,
+		},
+	}
+
+	header := &livekit.DataStream_Header{
+		StreamId:    info.Id,
+		MimeType:    info.MimeType,
+		Topic:       info.Topic,
+		Timestamp:   info.Timestamp,
+		TotalLength: info.Size,
+		Attributes:  info.Attributes,
+		ContentHeader: &livekit.DataStream_Header_TextHeader{
+			TextHeader: &livekit.DataStream_TextHeader{
+				OperationType:     livekit.DataStream_CREATE,
+				AttachedStreamIds: options.AttachedStreamIds,
+			},
+		},
+	}
+	if options.ReplyToStreamId != nil {
+		if textHeader, ok := header.ContentHeader.(*livekit.DataStream_Header_TextHeader); ok {
+			textHeader.TextHeader.ReplyToStreamId = *options.ReplyToStreamId
+		}
+	}
+
+	writer := newTextStreamWriter(info, header, p.engine, options.DestinationIdentities, options.OnProgress)
+
+	p.engine.OnClose(func() {
+		writer.Close()
+	})
+
+	return writer
+}
+
+// SendText creates a new text stream writer with the provided options.
+// It will return a TextStreamInfo that can be used to get metadata about the stream.
+func (p *LocalParticipant) SendText(text string, options StreamTextOptions) *TextStreamInfo {
+	if options.TotalSize == 0 {
+		textInBytes := []byte(text)
+		options.TotalSize = uint64(len(textInBytes))
+	}
+
+	// Ensure that the number of attached stream ids matches the number of attachments, generate if necessary
+	attachedStreamIds := options.AttachedStreamIds
+	numberOfAttachments := len(options.Attachments)
+	numberOfAttachedStreamIds := len(attachedStreamIds)
+	if numberOfAttachments > 0 {
+		if numberOfAttachedStreamIds != numberOfAttachments {
+			for i := numberOfAttachedStreamIds; i < numberOfAttachments; i++ {
+				attachedStreamIds = append(attachedStreamIds, uuid.New().String())
+			}
+		}
+	}
+	options.AttachedStreamIds = attachedStreamIds
+
+	var progresses sync.Map
+	for i := range numberOfAttachments + 1 {
+		progresses.Store(i, float64(0))
+	}
+
+	handleProgress := func(progress float64, id int) {
+		progresses.Store(id, progress)
+
+		var totalProgress float64
+		progresses.Range(func(_, value interface{}) bool {
+			totalProgress += value.(float64)
+			return true
+		})
+
+		if options.OnProgress != nil {
+			options.OnProgress(totalProgress / float64(numberOfAttachments+1))
+		}
+	}
+
+	textOptions := options
+	textOnProgress := func(progress float64) {
+		handleProgress(progress, 0)
+	}
+	textOptions.OnProgress = textOnProgress
+	writer := p.StreamText(textOptions)
+
+	onDone := func() {
+		writer.Close()
+	}
+	writer.Write(text, &onDone)
+
+	for i, attachment := range options.Attachments {
+		onProgress := func(progress float64) {
+			handleProgress(progress, i+1)
+		}
+		p.SendFile(attachment, StreamBytesOptions{
+			Topic:                 options.Topic,
+			DestinationIdentities: options.DestinationIdentities,
+			StreamId:              &attachedStreamIds[i],
+			OnProgress:            onProgress,
+			Attributes:            options.Attributes,
+		})
+	}
+
+	return &writer.Info
+}
+
+// StreamBytes creates a new byte stream writer with the provided options.
+func (p *LocalParticipant) StreamBytes(options StreamBytesOptions) *ByteStreamWriter {
+	if options.StreamId == nil {
+		streamId := uuid.New().String()
+		options.StreamId = &streamId
+	}
+
+	if options.Attributes == nil {
+		options.Attributes = make(map[string]string)
+	}
+
+	var totalSize *uint64
+	if options.TotalSize != 0 {
+		totalSize = &options.TotalSize
+	}
+
+	info := ByteStreamInfo{
+		baseStreamInfo: &baseStreamInfo{
+			Id:         *options.StreamId,
+			MimeType:   options.MimeType,
+			Topic:      options.Topic,
+			Timestamp:  time.Now().UnixMilli(),
+			Size:       totalSize,
+			Attributes: options.Attributes,
+		},
+	}
+
+	header := &livekit.DataStream_Header{
+		StreamId:    info.Id,
+		MimeType:    info.MimeType,
+		Topic:       info.Topic,
+		Timestamp:   info.Timestamp,
+		TotalLength: info.Size,
+		Attributes:  info.Attributes,
+		ContentHeader: &livekit.DataStream_Header_ByteHeader{
+			ByteHeader: &livekit.DataStream_ByteHeader{},
+		},
+	}
+
+	if options.FileName != nil {
+		if byteHeader, ok := header.ContentHeader.(*livekit.DataStream_Header_ByteHeader); ok {
+			byteHeader.ByteHeader.Name = *options.FileName
+		}
+		info.Name = options.FileName
+	}
+
+	writer := newByteStreamWriter(info, header, p.engine, options.DestinationIdentities, options.OnProgress)
+
+	p.engine.OnClose(func() {
+		writer.Close()
+	})
+
+	return writer
+}
+
+// SendFile sends a file to the remote participant as a byte stream with the provided options.
+// It will return a ByteStreamInfo that can be used to get metadata about the stream.
+// Error is returned if the file cannot be read.
+func (p *LocalParticipant) SendFile(filePath string, options StreamBytesOptions) (*ByteStreamInfo, error) {
+	if options.TotalSize == 0 {
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			return nil, err
+		}
+		options.TotalSize = uint64(fileInfo.Size())
+	}
+
+	if options.MimeType == "" {
+		mimeType := mime.TypeByExtension(filepath.Ext(filePath))
+		options.MimeType = mimeType
+	}
+
+	writer := p.StreamBytes(options)
+
+	fileBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+
+	onDone := func() {
+		writer.Close()
+	}
+	writer.Write(fileBytes, &onDone)
+
+	return &writer.Info, nil
+}
+
+func (p *LocalParticipant) getPublishTransport() *PCTransport {
+	publisher, ok := p.engine.Publisher()
+	if ok {
+		return publisher
+	}
+
+	return nil
 }

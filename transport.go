@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/bep/debounce"
-	protoLogger "github.com/livekit/protocol/logger"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/nack"
@@ -36,8 +35,8 @@ import (
 
 	lkinterceptor "github.com/livekit/mediatransportutil/pkg/interceptor"
 	"github.com/livekit/mediatransportutil/pkg/pacer"
+	protoLogger "github.com/livekit/protocol/logger"
 	lksdp "github.com/livekit/protocol/sdp"
-
 	sdkinterceptor "github.com/livekit/server-sdk-go/v2/pkg/interceptor"
 )
 
@@ -408,6 +407,23 @@ func (t *PCTransport) Negotiate() {
 	t.debouncedNegotiate(func() {
 		t.createAndSendOffer(nil)
 	})
+}
+
+func (t *PCTransport) GetLocalOffer() (webrtc.SessionDescription, error) {
+	offer, err := t.pc.CreateOffer(nil)
+	t.log.Debugw("get offer", "offer", offer.SDP)
+	if err != nil {
+		t.log.Errorw("could not get offer", err)
+		return webrtc.SessionDescription{}, err
+	}
+
+	return offer, nil
+}
+
+func (t *PCTransport) SetLocalOffer(offer webrtc.SessionDescription) {
+	if err := t.pc.SetLocalDescription(offer); err != nil {
+		t.log.Errorw("could not set local description offer", err)
+	}
 }
 
 func (t *PCTransport) createAndSendOffer(options *webrtc.OfferOptions) error {

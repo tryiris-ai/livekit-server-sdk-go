@@ -16,6 +16,7 @@ package lksdk
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -26,13 +27,20 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"golang.org/x/exp/maps"
+	"golang.org/x/mod/semver"
 	"google.golang.org/protobuf/proto"
 
 	protoLogger "github.com/livekit/protocol/logger"
+	protosignalling "github.com/livekit/protocol/signalling"
+	"github.com/livekit/server-sdk-go/v2/signalling"
 
 	"github.com/livekit/mediatransportutil/pkg/pacer"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+)
+
+var (
+	_ engineHandler = (*Room)(nil)
 )
 
 // -----------------------------------------------
@@ -89,25 +97,10 @@ type ConnectInfo struct {
 	ParticipantAttributes map[string]string
 }
 
-// not exposed to users. clients should use ConnectOption
-type SignalClientConnectParams struct {
-	AutoSubscribe          bool
-	Reconnect              bool
-	DisableRegionDiscovery bool
-
-	RetransmitBufferSize uint16
-
-	Pacer pacer.Factory
-
-	Interceptors []interceptor.Factory
-
-	ICETransportPolicy webrtc.ICETransportPolicy
-}
-
-type ConnectOption func(*SignalClientConnectParams)
+type ConnectOption func(*signalling.ConnectParams)
 
 func WithAutoSubscribe(val bool) ConnectOption {
-	return func(p *SignalClientConnectParams) {
+	return func(p *signalling.ConnectParams) {
 		p.AutoSubscribe = val
 	}
 }
@@ -115,7 +108,7 @@ func WithAutoSubscribe(val bool) ConnectOption {
 // Retransmit buffer size to reponse to nack request,
 // must be one of: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
 func WithRetransmitBufferSize(val uint16) ConnectOption {
-	return func(p *SignalClientConnectParams) {
+	return func(p *signalling.ConnectParams) {
 		p.RetransmitBufferSize = val
 	}
 }
@@ -123,40 +116,61 @@ func WithRetransmitBufferSize(val uint16) ConnectOption {
 // WithPacer enables the use of a pacer on this connection
 // A pacer helps to smooth out video packet rate to avoid overwhelming downstream. Learn more at: https://chromium.googlesource.com/external/webrtc/+/master/modules/pacing/g3doc/index.md
 func WithPacer(pacer pacer.Factory) ConnectOption {
-	return func(p *SignalClientConnectParams) {
+	return func(p *signalling.ConnectParams) {
 		p.Pacer = pacer
 	}
 }
 
 func WithInterceptors(interceptors []interceptor.Factory) ConnectOption {
-	return func(p *SignalClientConnectParams) {
+	return func(p *signalling.ConnectParams) {
 		p.Interceptors = interceptors
 	}
 }
 
 func WithICETransportPolicy(iceTransportPolicy webrtc.ICETransportPolicy) ConnectOption {
-	return func(p *SignalClientConnectParams) {
+	return func(p *signalling.ConnectParams) {
 		p.ICETransportPolicy = iceTransportPolicy
 	}
 }
 
 func WithDisableRegionDiscovery() ConnectOption {
-	return func(p *SignalClientConnectParams) {
+	return func(p *signalling.ConnectParams) {
 		p.DisableRegionDiscovery = true
+	}
+}
+
+func WithMetadata(metadata string) ConnectOption {
+	return func(p *signalling.ConnectParams) {
+		p.Metadata = metadata
+	}
+}
+
+func WithExtraAttributes(attrs map[string]string) ConnectOption {
+	return func(p *signalling.ConnectParams) {
+		if len(attrs) != 0 && p.Attributes == nil {
+			p.Attributes = make(map[string]string, len(attrs))
+		}
+		for k, v := range attrs {
+			if v == "" {
+				continue
+			}
+			p.Attributes[k] = v
+		}
 	}
 }
 
 type PLIWriter func(webrtc.SSRC)
 
 type Room struct {
-	log              protoLogger.Logger
-	engine           *RTCEngine
-	sid              string
-	name             string
-	LocalParticipant *LocalParticipant
-	callback         *RoomCallback
-	connectionState  ConnectionState
-	sidReady         chan struct{}
+	log                     protoLogger.Logger
+	useSinglePeerConnection bool
+	engine                  *RTCEngine
+	sid                     string
+	name                    string
+	LocalParticipant        *LocalParticipant
+	callback                *RoomCallback
+	connectionState         ConnectionState
+	sidReady                chan struct{}
 
 	remoteParticipants map[livekit.ParticipantIdentity]*RemoteParticipant
 	sidToIdentity      map[livekit.ParticipantID]livekit.ParticipantIdentity
@@ -168,46 +182,37 @@ type Room struct {
 
 	sifTrailer []byte
 
+	byteStreamHandlers *sync.Map
+	byteStreamReaders  *sync.Map
+	textStreamHandlers *sync.Map
+	textStreamReaders  *sync.Map
+	rpcHandlers        *sync.Map
+
 	lock sync.RWMutex
 }
 
 // NewRoom can be used to update callbacks before calling Join
 func NewRoom(callback *RoomCallback) *Room {
-	engine := NewRTCEngine()
 	r := &Room{
-		log:                logger,
-		engine:             engine,
-		remoteParticipants: make(map[livekit.ParticipantIdentity]*RemoteParticipant),
-		sidToIdentity:      make(map[livekit.ParticipantID]livekit.ParticipantIdentity),
-		sidDefers:          make(map[livekit.ParticipantID]map[livekit.TrackID]func(*RemoteParticipant)),
-		callback:           NewRoomCallback(),
-		sidReady:           make(chan struct{}),
-		connectionState:    ConnectionStateDisconnected,
-		regionURLProvider:  newRegionURLProvider(),
+		log:                     logger,
+		useSinglePeerConnection: semver.Compare("v"+Version, "v3.0.0") >= 0,
+		remoteParticipants:      make(map[livekit.ParticipantIdentity]*RemoteParticipant),
+		sidToIdentity:           make(map[livekit.ParticipantID]livekit.ParticipantIdentity),
+		sidDefers:               make(map[livekit.ParticipantID]map[livekit.TrackID]func(*RemoteParticipant)),
+		callback:                NewRoomCallback(),
+		sidReady:                make(chan struct{}),
+		connectionState:         ConnectionStateDisconnected,
+		regionURLProvider:       newRegionURLProvider(),
+		byteStreamHandlers:      &sync.Map{},
+		byteStreamReaders:       &sync.Map{},
+		textStreamHandlers:      &sync.Map{},
+		textStreamReaders:       &sync.Map{},
+		rpcHandlers:             &sync.Map{},
 	}
 	r.callback.Merge(callback)
-	r.LocalParticipant = newLocalParticipant(engine, r.callback)
 
-	// callbacks from engine
-	engine.OnSignalClientConnected = r.handleSignalClientConnected
-	engine.OnMediaTrack = r.handleMediaTrack
-	engine.OnDisconnected = r.handleDisconnect
-	engine.OnParticipantUpdate = r.handleParticipantUpdate
-	engine.OnSpeakersChanged = r.handleSpeakersChange
-	engine.OnDataPacket = r.handleDataReceived
-	engine.OnConnectionQuality = r.handleConnectionQualityUpdate
-	engine.OnRoomUpdate = r.handleRoomUpdate
-	engine.OnRestarting = r.handleRestarting
-	engine.OnRestarted = r.handleRestarted
-	engine.OnResuming = r.handleResuming
-	engine.OnResumed = r.handleResumed
-	engine.OnLocalTrackUnpublished = r.handleLocalTrackUnpublished
-	engine.OnTrackRemoteMuted = r.handleTrackRemoteMuted
-	engine.OnTranscription = r.handleTranscriptionReceived
-
-	// callbacks engine can use to get data
-	engine.CbGetLocalParticipantSID = r.getLocalParticipantSID
-
+	r.engine = NewRTCEngine(r.useSinglePeerConnection, r, r.getLocalParticipantSID)
+	r.LocalParticipant = newLocalParticipant(r.engine, r.callback, r.serverInfo)
 	return r
 }
 
@@ -262,7 +267,7 @@ func (r *Room) PrepareConnection(url, token string) error {
 
 // Join - joins the room as with default permissions
 func (r *Room) Join(url string, info ConnectInfo, opts ...ConnectOption) error {
-	var params SignalClientConnectParams
+	var params signalling.ConnectParams
 	for _, opt := range opts {
 		opt(&params)
 	}
@@ -292,29 +297,27 @@ func (r *Room) Join(url string, info ConnectInfo, opts ...ConnectOption) error {
 func (r *Room) JoinWithToken(url, token string, opts ...ConnectOption) error {
 	ctx := context.TODO()
 
-	params := &SignalClientConnectParams{
+	params := &signalling.ConnectParams{
 		AutoSubscribe: true,
 	}
 	for _, opt := range opts {
 		opt(params)
 	}
 
-	var joinRes *livekit.JoinResponse
+	isSuccess := false
 	cloudHostname, _ := parseCloudURL(url)
 	if !params.DisableRegionDiscovery && cloudHostname != "" {
 		if err := r.regionURLProvider.RefreshRegionSettings(cloudHostname, token); err != nil {
 			logger.Errorw("failed to get best url", err)
 		} else {
-			for tries := uint(0); joinRes == nil; tries++ {
+			for tries := uint(0); !isSuccess; tries++ {
 				bestURL, err := r.regionURLProvider.PopBestURL(cloudHostname, token)
 				if err != nil {
 					logger.Errorw("failed to get best url", err)
 					break
 				}
 
-				logger.Debugw("RTC engine joining room",
-					"url", bestURL,
-				)
+				logger.Debugw("RTC engine joining room", "url", bestURL)
 				// Not exposing this timeout as an option for now so that callers don't
 				// set unrealistic values.  We may reconsider in the future though.
 				// 4 seconds chosen to balance the trade-offs:
@@ -322,12 +325,13 @@ func (r *Room) JoinWithToken(url, token string, opts ...ConnectOption) error {
 				// - Too short, risk frequently timing out on a request that would have
 				//   succeeded.
 				callCtx, cancelCallCtx := context.WithTimeout(ctx, 4*time.Second)
-				joinRes, err = r.engine.JoinContext(callCtx, bestURL, token, params)
+				isSuccess, err = r.engine.JoinContext(callCtx, bestURL, token, params)
 				cancelCallCtx()
 				if err != nil {
 					// try the next URL with exponential backoff
 					d := time.Duration(1<<min(tries, 6)) * time.Second // max 64 seconds
-					logger.Errorw("failed to join room", err,
+					logger.Errorw(
+						"failed to join room", err,
 						"retrying in", d,
 						"url", bestURL,
 					)
@@ -338,10 +342,8 @@ func (r *Room) JoinWithToken(url, token string, opts ...ConnectOption) error {
 		}
 	}
 
-	if joinRes == nil {
-		var err error
-		_, err = r.engine.JoinContext(ctx, url, token, params)
-		if err != nil {
+	if !isSuccess {
+		if _, err := r.engine.JoinContext(ctx, url, token, params); err != nil {
 			return err
 		}
 	}
@@ -354,7 +356,7 @@ func (r *Room) Disconnect() {
 }
 
 func (r *Room) DisconnectWithReason(reason livekit.DisconnectReason) {
-	_ = r.engine.client.SendLeaveWithReason(reason)
+	_ = r.engine.SendLeaveWithReason(reason)
 	r.cleanup()
 }
 
@@ -493,7 +495,7 @@ func (r *Room) addRemoteParticipant(pi *livekit.ParticipantInfo, updateExisting 
 		return rp
 	}
 
-	rp = newRemoteParticipant(pi, r.callback, r.engine.client, func(ssrc webrtc.SSRC) {
+	rp = newRemoteParticipant(pi, r.callback, r.engine, func(ssrc webrtc.SSRC) {
 		pli := []rtcp.Packet{
 			&rtcp.PictureLossIndication{SenderSSRC: uint32(ssrc), MediaSSRC: uint32(ssrc)},
 		}
@@ -506,7 +508,190 @@ func (r *Room) addRemoteParticipant(pi *livekit.ParticipantInfo, updateExisting 
 	return rp
 }
 
-func (r *Room) handleMediaTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+func (r *Room) sendSyncState() {
+	var previousOffer *webrtc.SessionDescription
+	var previousAnswer *webrtc.SessionDescription
+	if r.useSinglePeerConnection {
+		publisher, ok := r.engine.Publisher()
+		if ok {
+			previousOffer = publisher.pc.RemoteDescription()
+			previousAnswer = publisher.pc.LocalDescription()
+		}
+	} else {
+		subscriber, ok := r.engine.Subscriber()
+		if ok {
+			previousOffer = subscriber.pc.RemoteDescription()
+			previousAnswer = subscriber.pc.LocalDescription()
+		}
+	}
+	if previousOffer == nil || previousAnswer == nil {
+		return
+	}
+
+	var trackSids []string
+	var trackSidsDisabled []string
+	sendUnsub := r.engine.connParams.AutoSubscribe
+	for _, rp := range r.GetRemoteParticipants() {
+		for _, t := range rp.TrackPublications() {
+			if t.IsSubscribed() != sendUnsub {
+				trackSids = append(trackSids, t.SID())
+			}
+
+			if rpub, ok := t.(*RemoteTrackPublication); ok {
+				if !rpub.IsEnabled() {
+					trackSidsDisabled = append(trackSidsDisabled, t.SID())
+				}
+			}
+		}
+	}
+
+	var publishedTracks []*livekit.TrackPublishedResponse
+	for _, t := range r.LocalParticipant.TrackPublications() {
+		if t.Track() != nil {
+			publishedTracks = append(publishedTracks, &livekit.TrackPublishedResponse{
+				Cid:   t.Track().ID(),
+				Track: t.TrackInfo(),
+			})
+		}
+	}
+
+	var dataChannels []*livekit.DataChannelInfo
+	getDCinfo := func(dc *webrtc.DataChannel, target livekit.SignalTarget) {
+		if dc != nil && dc.ID() != nil {
+			dataChannels = append(dataChannels, &livekit.DataChannelInfo{
+				Label:  dc.Label(),
+				Id:     uint32(*dc.ID()),
+				Target: target,
+			})
+		}
+	}
+
+	getDCinfo(r.engine.GetDataChannel(livekit.DataPacket_RELIABLE), livekit.SignalTarget_PUBLISHER)
+	getDCinfo(r.engine.GetDataChannel(livekit.DataPacket_LOSSY), livekit.SignalTarget_PUBLISHER)
+	getDCinfo(r.engine.GetDataChannelSub(livekit.DataPacket_RELIABLE), livekit.SignalTarget_SUBSCRIBER)
+	getDCinfo(r.engine.GetDataChannelSub(livekit.DataPacket_LOSSY), livekit.SignalTarget_SUBSCRIBER)
+
+	r.engine.SendSyncState(&livekit.SyncState{
+		Offer:  protosignalling.ToProtoSessionDescription(*previousOffer, 0),
+		Answer: protosignalling.ToProtoSessionDescription(*previousAnswer, 0),
+		Subscription: &livekit.UpdateSubscription{
+			TrackSids: trackSids,
+			Subscribe: !sendUnsub,
+		},
+		PublishTracks:     publishedTracks,
+		DataChannels:      dataChannels,
+		TrackSidsDisabled: trackSidsDisabled,
+		// MIGRATION-TODO DatachannelReceiveStates
+	})
+}
+
+func (r *Room) cleanup() {
+	r.setConnectionState(ConnectionStateDisconnected)
+	r.engine.Close()
+	r.LocalParticipant.closeTracks()
+	r.setSid("", true)
+	r.byteStreamHandlers.Clear()
+	r.byteStreamReaders.Clear()
+	r.textStreamHandlers.Clear()
+	r.textStreamReaders.Clear()
+	r.rpcHandlers.Clear()
+	r.LocalParticipant.cleanup()
+}
+
+func (r *Room) setSid(sid string, allowEmpty bool) {
+	r.lock.Lock()
+	if sid != "" || allowEmpty {
+		select {
+		case <-r.sidReady:
+		// already closed
+		default:
+			r.sid = sid
+			close(r.sidReady)
+		}
+	}
+	r.lock.Unlock()
+}
+
+func (r *Room) Simulate(scenario SimulateScenario) {
+	r.engine.Simulate(scenario)
+}
+
+func (r *Room) getLocalParticipantSID() string {
+	if r.LocalParticipant != nil {
+		return r.LocalParticipant.SID()
+	}
+
+	return ""
+}
+
+// Establishes the participant as a receiver for calls of the specified RPC method.
+// Will overwrite any existing callback for the same method.
+//
+//   - @param method - The name of the indicated RPC method
+//   - @param handler - Will be invoked when an RPC request for this method is received
+//   - @returns A promise that resolves when the method is successfully registered
+//
+// Example:
+//
+//	room.LocalParticipant?.registerRpcMethod(
+//		"greet",
+//		func (data: RpcInvocationData) => {
+//			fmt.Println("Received greeting from ", data.callerIdentity, "with payload ", data.payload)
+//			return "Hello, " + data.callerIdentity + "!";
+//		}
+//	);
+//
+// The handler should return either a string or an error.
+// If unable to respond within `responseTimeout`, the request will result in an error on the caller's side.
+//
+// You may throw errors of type `RpcError` with a string `message` in the handler,
+// and they will be received on the caller's side with the message intact.
+// Other errors thrown in your handler will not be transmitted as-is, and will instead arrive to the caller as `1500` ("Application Error").
+func (r *Room) RegisterRpcMethod(method string, handler RpcHandlerFunc) error {
+	if _, loaded := r.rpcHandlers.LoadOrStore(method, handler); loaded {
+		return fmt.Errorf("rpc handler already registered for method: %s, unregisterRpcMethod before trying to register again", method)
+	}
+	return nil
+}
+
+// Unregisters a previously registered RPC method.
+//   - @param method - The name of the RPC method to unregister
+func (r *Room) UnregisterRpcMethod(method string) {
+	r.rpcHandlers.Delete(method)
+}
+
+// Registers a handler for a text stream.
+// It will be called when a text stream is received for the given topic.
+// The handler will be called with the stream reader and the participant identity that sent the stream.
+func (r *Room) RegisterTextStreamHandler(topic string, handler TextStreamHandler) error {
+	if _, loaded := r.textStreamHandlers.LoadOrStore(topic, handler); loaded {
+		return fmt.Errorf("text stream handler already registered for topic: %s", topic)
+	}
+	return nil
+}
+
+// Unregisters a handler for a text stream.
+func (r *Room) UnregisterTextStreamHandler(topic string) {
+	r.textStreamHandlers.Delete(topic)
+}
+
+// Registers a handler for a byte stream.
+// It will be called when a byte stream is received for the given topic.
+// The handler will be called with the stream reader and the participant identity that sent the stream.
+func (r *Room) RegisterByteStreamHandler(topic string, handler ByteStreamHandler) error {
+	if _, loaded := r.byteStreamHandlers.LoadOrStore(topic, handler); loaded {
+		return fmt.Errorf("byte stream handler already registered for topic: %s", topic)
+	}
+	return nil
+}
+
+// Unregisters a handler for a byte stream.
+func (r *Room) UnregisterByteStreamHandler(topic string) {
+	r.byteStreamHandlers.Delete(topic)
+}
+
+// engineHandler implementation
+func (r *Room) OnMediaTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	// ensure we have the participant
 	participantID, streamID := unpackStreamID(track.StreamID())
 	trackID := track.ID()
@@ -534,51 +719,61 @@ func (r *Room) handleMediaTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPR
 	r.runParticipantDefers(livekit.ParticipantID(participantID), rp)
 }
 
-func (r *Room) handleSignalClientConnected(joinRes *livekit.JoinResponse) {
+func (r *Room) OnRoomJoined(
+	room *livekit.Room,
+	participant *livekit.ParticipantInfo,
+	otherParticipants []*livekit.ParticipantInfo,
+	serverInfo *livekit.ServerInfo,
+	sifTrailer []byte,
+) {
 	r.lock.Lock()
-	r.name = joinRes.Room.Name
-	r.metadata = joinRes.Room.Metadata
-	r.serverInfo = joinRes.ServerInfo
+	r.name = room.Name
+	r.metadata = room.Metadata
+	r.serverInfo = serverInfo
 	r.connectionState = ConnectionStateConnected
-	r.sifTrailer = make([]byte, len(joinRes.SifTrailer))
-	copy(r.sifTrailer, joinRes.SifTrailer)
+	r.sifTrailer = make([]byte, len(sifTrailer))
+	copy(r.sifTrailer, sifTrailer)
 	r.lock.Unlock()
 
-	r.setSid(joinRes.Room.Sid, false)
+	r.setSid(room.Sid, false)
 
-	r.LocalParticipant.updateInfo(joinRes.Participant)
+	r.LocalParticipant.updateInfo(participant)
 	r.LocalParticipant.updateSubscriptionPermission()
 
-	for _, pi := range joinRes.OtherParticipants {
+	for _, pi := range otherParticipants {
 		r.addRemoteParticipant(pi, true)
 		r.clearParticipantDefers(livekit.ParticipantID(pi.Sid), pi)
 		// no need to run participant defers here, since we are connected for the first time
 	}
 }
 
-func (r *Room) handleDisconnect(reason DisconnectionReason) {
+func (r *Room) OnDisconnected(reason DisconnectionReason) {
 	r.callback.OnDisconnected()
 	r.callback.OnDisconnectedWithReason(reason)
 
 	r.cleanup()
 }
 
-func (r *Room) handleRestarting() {
+func (r *Room) OnRestarting() {
 	r.setConnectionState(ConnectionStateReconnecting)
 	r.callback.OnReconnecting()
 
 	for _, rp := range r.GetRemoteParticipants() {
-		r.handleParticipantDisconnect(rp)
+		r.OnParticipantDisconnect(rp)
 	}
 }
 
-func (r *Room) handleRestarted(joinRes *livekit.JoinResponse) {
-	r.handleRoomUpdate(joinRes.Room)
+func (r *Room) OnRestarted(
+	room *livekit.Room,
+	participant *livekit.ParticipantInfo,
+	otherParticipants []*livekit.ParticipantInfo,
+) {
+	r.OnRoomUpdate(room)
 
-	r.LocalParticipant.updateInfo(joinRes.Participant)
+	r.LocalParticipant.updateInfo(participant)
 	r.LocalParticipant.updateSubscriptionPermission()
 
-	r.handleParticipantUpdate(joinRes.OtherParticipants)
+	r.OnParticipantUpdate(otherParticipants)
 
 	r.LocalParticipant.republishTracks()
 
@@ -586,19 +781,19 @@ func (r *Room) handleRestarted(joinRes *livekit.JoinResponse) {
 	r.callback.OnReconnected()
 }
 
-func (r *Room) handleResuming() {
+func (r *Room) OnResuming() {
 	r.setConnectionState(ConnectionStateReconnecting)
 	r.callback.OnReconnecting()
 }
 
-func (r *Room) handleResumed() {
+func (r *Room) OnResumed() {
 	r.setConnectionState(ConnectionStateConnected)
 	r.callback.OnReconnected()
 	r.sendSyncState()
 	r.LocalParticipant.updateSubscriptionPermission()
 }
 
-func (r *Room) handleDataReceived(identity string, dataPacket DataPacket) {
+func (r *Room) OnDataPacket(identity string, dataPacket DataPacket) {
 	if identity == r.LocalParticipant.Identity() {
 		// if sent by itself, do not handle data
 		return
@@ -622,7 +817,7 @@ func (r *Room) handleDataReceived(identity string, dataPacket DataPacket) {
 	r.callback.OnDataPacket(dataPacket, params)
 }
 
-func (r *Room) handleParticipantUpdate(participants []*livekit.ParticipantInfo) {
+func (r *Room) OnParticipantUpdate(participants []*livekit.ParticipantInfo) {
 	for _, pi := range participants {
 		if pi.Sid == r.LocalParticipant.SID() || pi.Identity == r.LocalParticipant.Identity() {
 			r.LocalParticipant.updateInfo(pi)
@@ -633,7 +828,7 @@ func (r *Room) handleParticipantUpdate(participants []*livekit.ParticipantInfo) 
 		isNew := rp == nil
 
 		if pi.State == livekit.ParticipantInfo_DISCONNECTED {
-			r.handleParticipantDisconnect(rp)
+			r.OnParticipantDisconnect(rp)
 		} else if isNew {
 			rp = r.addRemoteParticipant(pi, true)
 			r.clearParticipantDefers(livekit.ParticipantID(pi.Sid), pi)
@@ -662,7 +857,7 @@ func (r *Room) handleParticipantUpdate(participants []*livekit.ParticipantInfo) 
 	}
 }
 
-func (r *Room) handleParticipantDisconnect(rp *RemoteParticipant) {
+func (r *Room) OnParticipantDisconnect(rp *RemoteParticipant) {
 	if rp == nil {
 		return
 	}
@@ -674,10 +869,11 @@ func (r *Room) handleParticipantDisconnect(rp *RemoteParticipant) {
 	r.lock.Unlock()
 
 	rp.unpublishAllTracks()
+	r.LocalParticipant.handleParticipantDisconnected(rp.Identity())
 	go r.callback.OnParticipantDisconnected(rp)
 }
 
-func (r *Room) handleSpeakersChange(speakerUpdates []*livekit.SpeakerInfo) {
+func (r *Room) OnSpeakersChanged(speakerUpdates []*livekit.SpeakerInfo) {
 	speakerMap := make(map[string]Participant)
 	for _, p := range r.ActiveSpeakers() {
 		speakerMap[p.SID()] = p
@@ -713,7 +909,7 @@ func (r *Room) handleSpeakersChange(speakerUpdates []*livekit.SpeakerInfo) {
 	go r.callback.OnActiveSpeakersChanged(activeSpeakers)
 }
 
-func (r *Room) handleConnectionQualityUpdate(updates []*livekit.ConnectionQualityInfo) {
+func (r *Room) OnConnectionQuality(updates []*livekit.ConnectionQualityInfo) {
 	for _, update := range updates {
 		if update.ParticipantSid == r.LocalParticipant.SID() {
 			r.LocalParticipant.setConnectionQualityInfo(update)
@@ -729,7 +925,7 @@ func (r *Room) handleConnectionQualityUpdate(updates []*livekit.ConnectionQualit
 	}
 }
 
-func (r *Room) handleRoomUpdate(room *livekit.Room) {
+func (r *Room) OnRoomUpdate(room *livekit.Room) {
 	metadataChanged := false
 	r.lock.Lock()
 	if r.metadata != room.Metadata {
@@ -743,7 +939,23 @@ func (r *Room) handleRoomUpdate(room *livekit.Room) {
 	}
 }
 
-func (r *Room) handleTrackRemoteMuted(msg *livekit.MuteTrackRequest) {
+func (r *Room) OnRoomMoved(moved *livekit.RoomMovedResponse) {
+	r.log.Infow("room moved", "newRoom", moved.Room.Name)
+	r.OnRoomUpdate(moved.Room)
+
+	for _, rp := range r.GetRemoteParticipants() {
+		r.OnParticipantDisconnect(rp)
+	}
+
+	go r.callback.OnRoomMoved(moved.Room.Name, moved.Token)
+
+	infos := make([]*livekit.ParticipantInfo, 0, len(moved.OtherParticipants)+1)
+	infos = append(infos, moved.Participant)
+	infos = append(infos, moved.OtherParticipants...)
+	r.OnParticipantUpdate(infos)
+}
+
+func (r *Room) OnTrackRemoteMuted(msg *livekit.MuteTrackRequest) {
 	for _, pub := range r.LocalParticipant.TrackPublications() {
 		if pub.SID() == msg.Sid {
 			localPub := pub.(*LocalTrackPublication)
@@ -753,14 +965,14 @@ func (r *Room) handleTrackRemoteMuted(msg *livekit.MuteTrackRequest) {
 	}
 }
 
-func (r *Room) handleLocalTrackUnpublished(msg *livekit.TrackUnpublishedResponse) {
+func (r *Room) OnLocalTrackUnpublished(msg *livekit.TrackUnpublishedResponse) {
 	err := r.LocalParticipant.UnpublishTrack(msg.TrackSid)
 	if err != nil {
 		r.log.Errorw("could not unpublish track", err, "trackID", msg.TrackSid)
 	}
 }
 
-func (r *Room) handleTranscriptionReceived(transcription *livekit.Transcription) {
+func (r *Room) OnTranscription(transcription *livekit.Transcription) {
 	var (
 		p           Participant
 		publication TrackPublication
@@ -783,145 +995,224 @@ func (r *Room) handleTranscriptionReceived(transcription *livekit.Transcription)
 	r.callback.OnTranscriptionReceived(transcriptionSegments, p, publication)
 }
 
-func (r *Room) sendSyncState() {
-	subscriber, ok := r.engine.Subscriber()
-	if !ok || subscriber.pc.RemoteDescription() == nil {
+func (r *Room) OnLocalTrackSubscribed(trackSubscribed *livekit.TrackSubscribed) {
+	trackPublication := r.LocalParticipant.getLocalPublication(trackSubscribed.TrackSid)
+	if trackPublication == nil {
+		r.log.Debugw("recieved track subscribed for unknown track", "trackID", trackSubscribed.TrackSid)
+		return
+	}
+	r.callback.OnLocalTrackSubscribed(trackPublication, r.LocalParticipant)
+}
+
+func (r *Room) OnSubscribedQualityUpdate(subscribedQualityUpdate *livekit.SubscribedQualityUpdate) {
+	trackPublication := r.LocalParticipant.getLocalPublication(subscribedQualityUpdate.TrackSid)
+	if trackPublication == nil {
+		r.log.Debugw("recieved subscribed quality update for unknown track", "trackID", subscribedQualityUpdate.TrackSid)
 		return
 	}
 
-	previousSdp := subscriber.pc.LocalDescription()
+	r.log.Infow(
+		"handling subscribed quality update",
+		"trackID", trackPublication.SID(),
+		"mime", trackPublication.MimeType(),
+		"subscribedQualityUpdate", protoLogger.Proto(subscribedQualityUpdate),
+	)
+	for _, subscribedCodec := range subscribedQualityUpdate.SubscribedCodecs {
+		if !strings.HasSuffix(strings.ToLower(trackPublication.MimeType()), subscribedCodec.Codec) {
+			continue
+		}
 
-	var trackSids []string
-	sendUnsub := r.engine.connParams.AutoSubscribe
-	for _, rp := range r.GetRemoteParticipants() {
-		for _, t := range rp.TrackPublications() {
-			if t.IsSubscribed() != sendUnsub {
-				trackSids = append(trackSids, t.SID())
+		for _, subscribedQuality := range subscribedCodec.Qualities {
+			track := trackPublication.GetSimulcastTrack(subscribedQuality.Quality)
+			if track != nil {
+				track.setMuted(!subscribedQuality.Enabled)
+				r.log.Infow(
+					"updating layer enable",
+					"trackID", trackPublication.SID(),
+					"quality", subscribedQuality.Quality,
+					"enabled", subscribedQuality.Enabled,
+				)
+			}
+		}
+	}
+}
+
+func (r *Room) OnMediaSectionsRequirement(mediaSectionsRequirement *livekit.MediaSectionsRequirement) {
+	addTransceivers := func(transport *PCTransport, kind webrtc.RTPCodecType, count uint32) {
+		for i := uint32(0); i < count; i++ {
+			if _, err := transport.PeerConnection().AddTransceiverFromKind(
+				kind,
+				webrtc.RTPTransceiverInit{
+					Direction: webrtc.RTPTransceiverDirectionRecvonly,
+				},
+			); err != nil {
+				r.log.Warnw(
+					"could not add transceiver", err,
+					"room", r.name,
+					"roomID", r.sid,
+					"participant", r.LocalParticipant.Identity(),
+					"pID", r.LocalParticipant.SID(),
+					"kind", kind,
+				)
+			} else {
+				r.log.Debugw(
+					"added transceiver of kind",
+					"room", r.name,
+					"roomID", r.sid,
+					"participant", r.LocalParticipant.Identity(),
+					"pID", r.LocalParticipant.SID(),
+					"kind", kind,
+				)
 			}
 		}
 	}
 
-	var publishedTracks []*livekit.TrackPublishedResponse
-	for _, t := range r.LocalParticipant.TrackPublications() {
-		if t.Track() != nil {
-			publishedTracks = append(publishedTracks, &livekit.TrackPublishedResponse{
-				Cid:   t.Track().ID(),
-				Track: t.TrackInfo(),
-			})
+	publisher, ok := r.engine.Publisher()
+	if !ok {
+		r.log.Warnw("no publisher peer connection", ErrNoPeerConnection)
+		return
+	}
+
+	addTransceivers(publisher, webrtc.RTPCodecTypeAudio, mediaSectionsRequirement.NumAudios)
+	addTransceivers(publisher, webrtc.RTPCodecTypeVideo, mediaSectionsRequirement.NumVideos)
+	publisher.Negotiate()
+}
+
+func (r *Room) OnStreamHeader(streamHeader *livekit.DataStream_Header, participantIdentity string) {
+	switch header := streamHeader.ContentHeader.(type) {
+	case *livekit.DataStream_Header_TextHeader:
+		streamHandlerCallback, ok := r.textStreamHandlers.Load(streamHeader.Topic)
+		if !ok {
+			r.log.Debugw("ignoring incoming text stream due to no handler for topic", "topic", streamHeader.Topic)
+			return
+		}
+
+		info := TextStreamInfo{
+			baseStreamInfo: &baseStreamInfo{
+				Id:         streamHeader.StreamId,
+				MimeType:   streamHeader.MimeType,
+				Size:       streamHeader.TotalLength,
+				Topic:      streamHeader.Topic,
+				Timestamp:  streamHeader.Timestamp,
+				Attributes: streamHeader.Attributes,
+			},
+		}
+
+		textStreamReader := NewTextStreamReader(info, streamHeader.TotalLength)
+		r.textStreamReaders.Store(streamHeader.StreamId, textStreamReader)
+		go streamHandlerCallback.(TextStreamHandler)(textStreamReader, participantIdentity)
+	case *livekit.DataStream_Header_ByteHeader:
+		streamHandlerCallback, ok := r.byteStreamHandlers.Load(streamHeader.Topic)
+		if !ok {
+			r.log.Debugw("ignoring incoming byte stream due to no handler for topic", "topic", streamHeader.Topic)
+			return
+		}
+
+		info := ByteStreamInfo{
+			baseStreamInfo: &baseStreamInfo{
+				Id:         streamHeader.StreamId,
+				MimeType:   streamHeader.MimeType,
+				Size:       streamHeader.TotalLength,
+				Topic:      streamHeader.Topic,
+				Timestamp:  streamHeader.Timestamp,
+				Attributes: streamHeader.Attributes,
+			},
+			Name: &header.ByteHeader.Name,
+		}
+
+		byteStreamReader := NewByteStreamReader(info, streamHeader.TotalLength)
+		r.byteStreamReaders.Store(streamHeader.StreamId, byteStreamReader)
+		go streamHandlerCallback.(ByteStreamHandler)(byteStreamReader, participantIdentity)
+	}
+}
+
+func (r *Room) OnStreamChunk(streamChunk *livekit.DataStream_Chunk) {
+	streamId := streamChunk.StreamId
+
+	byteStreamReader, ok := r.byteStreamReaders.Load(streamId)
+	if ok {
+		if len(streamChunk.Content) > 0 {
+			byteStreamReader.(*ByteStreamReader).enqueue(streamChunk)
 		}
 	}
 
-	var dataChannels []*livekit.DataChannelInfo
-	getDCinfo := func(dc *webrtc.DataChannel, target livekit.SignalTarget) {
-		if dc != nil && dc.ID() != nil {
-			dataChannels = append(dataChannels, &livekit.DataChannelInfo{
-				Label:  dc.Label(),
-				Id:     uint32(*dc.ID()),
-				Target: target,
-			})
+	textStreamReader, ok := r.textStreamReaders.Load(streamId)
+	if ok {
+		if len(streamChunk.Content) > 0 {
+			textStreamReader.(*TextStreamReader).enqueue(streamChunk)
 		}
 	}
+}
 
-	getDCinfo(r.engine.GetDataChannel(livekit.DataPacket_RELIABLE), livekit.SignalTarget_PUBLISHER)
-	getDCinfo(r.engine.GetDataChannel(livekit.DataPacket_LOSSY), livekit.SignalTarget_PUBLISHER)
-	getDCinfo(r.engine.GetDataChannelSub(livekit.DataPacket_RELIABLE), livekit.SignalTarget_SUBSCRIBER)
-	getDCinfo(r.engine.GetDataChannelSub(livekit.DataPacket_LOSSY), livekit.SignalTarget_SUBSCRIBER)
+func (r *Room) OnStreamTrailer(streamTrailer *livekit.DataStream_Trailer) {
+	streamId := streamTrailer.StreamId
 
-	r.engine.client.SendSyncState(&livekit.SyncState{
-		Answer: ToProtoSessionDescription(*previousSdp),
-		Subscription: &livekit.UpdateSubscription{
-			TrackSids: trackSids,
-			Subscribe: !sendUnsub,
-		},
-		PublishTracks: publishedTracks,
-		DataChannels:  dataChannels,
+	byteStreamReader, ok := r.byteStreamReaders.Load(streamId)
+	if ok {
+		reader := byteStreamReader.(*ByteStreamReader)
+		for k, v := range streamTrailer.Attributes {
+			reader.Info.Attributes[k] = v
+		}
+		reader.close()
+		r.byteStreamReaders.Delete(streamId)
+	}
+
+	textStreamReader, ok := r.textStreamReaders.Load(streamId)
+	if ok {
+		reader := textStreamReader.(*TextStreamReader)
+		for k, v := range streamTrailer.Attributes {
+			reader.Info.Attributes[k] = v
+		}
+		reader.close()
+		r.textStreamReaders.Delete(streamId)
+	}
+}
+
+func (r *Room) OnRpcRequest(callerIdentity, requestId, method, payload string, responseTimeout time.Duration, version uint32) {
+	r.engine.publishRpcAck(callerIdentity, requestId)
+
+	if version != 1 {
+		r.engine.publishRpcResponse(callerIdentity, requestId, nil, rpcErrorFromBuiltInCodes(RpcUnsupportedVersion, nil))
+		return
+	}
+
+	handler, ok := r.rpcHandlers.Load(method)
+	if !ok {
+		r.engine.publishRpcResponse(callerIdentity, requestId, nil, rpcErrorFromBuiltInCodes(RpcUnsupportedMethod, nil))
+		return
+	}
+
+	response, err := handler.(RpcHandlerFunc)(RpcInvocationData{
+		RequestID:       requestId,
+		CallerIdentity:  callerIdentity,
+		Payload:         payload,
+		ResponseTimeout: responseTimeout,
 	})
-}
 
-func (r *Room) cleanup() {
-	r.setConnectionState(ConnectionStateDisconnected)
-	r.engine.Close()
-	r.LocalParticipant.closeTracks()
-	r.setSid("", true)
-}
-
-func (r *Room) setSid(sid string, allowEmpty bool) {
-	r.lock.Lock()
-	if sid != "" || allowEmpty {
-		select {
-		case <-r.sidReady:
-		// already closed
-		default:
-			r.sid = sid
-			close(r.sidReady)
+	if err != nil {
+		if _, ok := err.(*RpcError); ok {
+			r.engine.publishRpcResponse(callerIdentity, requestId, nil, err.(*RpcError))
+		} else {
+			r.log.Warnw("unexpected error returned by RPC handler for method, using application error instead", err, "method", method)
+			r.engine.publishRpcResponse(callerIdentity, requestId, nil, rpcErrorFromBuiltInCodes(RpcApplicationError, nil))
 		}
+		return
 	}
-	r.lock.Unlock()
+
+	if byteLength(response) > MaxDataBytes {
+		r.engine.publishRpcResponse(callerIdentity, requestId, nil, rpcErrorFromBuiltInCodes(RpcResponsePayloadTooLarge, nil))
+		return
+	}
+
+	r.engine.publishRpcResponse(callerIdentity, requestId, &response, nil)
 }
 
-func (r *Room) Simulate(scenario SimulateScenario) {
-	switch scenario {
-	case SimulateSignalReconnect:
-		r.engine.client.Close()
-	case SimulateForceTCP:
-		// pion does not support active tcp candidate, skip
-	case SimulateForceTLS:
-		req := &livekit.SignalRequest{
-			Message: &livekit.SignalRequest_Simulate{
-				Simulate: &livekit.SimulateScenario{
-					Scenario: &livekit.SimulateScenario_SwitchCandidateProtocol{
-						SwitchCandidateProtocol: livekit.CandidateProtocol_TLS,
-					},
-				},
-			},
-		}
-		r.engine.client.SendRequest(req)
-		r.engine.client.OnLeave(&livekit.LeaveRequest{CanReconnect: true, Reason: livekit.DisconnectReason_CLIENT_INITIATED})
-	case SimulateSpeakerUpdate:
-		r.engine.client.SendRequest(&livekit.SignalRequest{
-			Message: &livekit.SignalRequest_Simulate{
-				Simulate: &livekit.SimulateScenario{
-					Scenario: &livekit.SimulateScenario_SpeakerUpdate{
-						SpeakerUpdate: SimulateSpeakerUpdateInterval,
-					},
-				},
-			},
-		})
-	case SimulateMigration:
-		r.engine.client.SendRequest(&livekit.SignalRequest{
-			Message: &livekit.SignalRequest_Simulate{
-				Simulate: &livekit.SimulateScenario{
-					Scenario: &livekit.SimulateScenario_Migration{
-						Migration: true,
-					},
-				},
-			},
-		})
-	case SimulateServerLeave:
-		r.engine.client.SendRequest(&livekit.SignalRequest{
-			Message: &livekit.SignalRequest_Simulate{
-				Simulate: &livekit.SimulateScenario{
-					Scenario: &livekit.SimulateScenario_ServerLeave{
-						ServerLeave: true,
-					},
-				},
-			},
-		})
-	case SimulateNodeFailure:
-		r.engine.client.SendRequest(&livekit.SignalRequest{
-			Message: &livekit.SignalRequest_Simulate{
-				Simulate: &livekit.SimulateScenario{
-					Scenario: &livekit.SimulateScenario_NodeFailure{
-						NodeFailure: true,
-					},
-				},
-			},
-		})
-	}
+func (r *Room) OnRpcAck(requestId string) {
+	r.LocalParticipant.HandleIncomingRpcAck(requestId)
 }
 
-func (r *Room) getLocalParticipantSID() string {
-	return r.LocalParticipant.SID()
+func (r *Room) OnRpcResponse(requestId string, payload *string, error *RpcError) {
+	r.LocalParticipant.HandleIncomingRpcResponse(requestId, payload, error)
 }
 
 // ---------------------------------------------------------
