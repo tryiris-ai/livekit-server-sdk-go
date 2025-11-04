@@ -16,8 +16,11 @@ package lksdk
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/exp/maps"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -25,6 +28,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/protocol/livekit"
+	protoLogger "github.com/livekit/protocol/logger"
 )
 
 type TrackPublication interface {
@@ -150,6 +154,8 @@ type RemoteTrackPublication struct {
 	videoQuality *livekit.VideoQuality
 }
 
+// TrackRemote returns the underlying webrtc.TrackRemote if available.
+// Returns nil if the track is not subscribed
 func (p *RemoteTrackPublication) TrackRemote() *webrtc.TrackRemote {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -159,12 +165,15 @@ func (p *RemoteTrackPublication) TrackRemote() *webrtc.TrackRemote {
 	return nil
 }
 
+// Receiver returns the RTP receiver associated with this track publication.
 func (p *RemoteTrackPublication) Receiver() *webrtc.RTPReceiver {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 	return p.receiver
 }
 
+// SetSubscribed subscribes or unsubscribes from this track.
+// When subscribed, track data will be received from the server.
 func (p *RemoteTrackPublication) SetSubscribed(subscribed bool) error {
 	return p.engine.SendUpdateSubscription(
 		&livekit.UpdateSubscription{
@@ -179,12 +188,16 @@ func (p *RemoteTrackPublication) SetSubscribed(subscribed bool) error {
 	)
 }
 
+// IsEnabled returns whether the track is enabled (not disabled).
+// Disabled tracks will not receive media data even when subscribed.
 func (p *RemoteTrackPublication) IsEnabled() bool {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 	return !p.disabled
 }
 
+// SetEnabled enables or disables the track.
+// When disabled, the track will not receive media data even when subscribed.
 func (p *RemoteTrackPublication) SetEnabled(enabled bool) {
 	p.lock.Lock()
 	p.disabled = !enabled
@@ -193,6 +206,8 @@ func (p *RemoteTrackPublication) SetEnabled(enabled bool) {
 	p.updateSettings()
 }
 
+// SetVideoDimensions sets the preferred video dimensions to receive.
+// This is a hint to the server about what resolution to send.
 func (p *RemoteTrackPublication) SetVideoDimensions(width uint32, height uint32) {
 	p.lock.Lock()
 	p.videoWidth = &width
@@ -202,6 +217,7 @@ func (p *RemoteTrackPublication) SetVideoDimensions(width uint32, height uint32)
 	p.updateSettings()
 }
 
+// SetVideoQuality sets the preferred video quality to receive.
 func (p *RemoteTrackPublication) SetVideoQuality(quality livekit.VideoQuality) error {
 	if quality == livekit.VideoQuality_OFF {
 		return errors.New("cannot set video quality to OFF")
@@ -214,6 +230,7 @@ func (p *RemoteTrackPublication) SetVideoQuality(quality livekit.VideoQuality) e
 	return nil
 }
 
+// OnRTCP sets a callback to receive RTCP packets for this track.
 func (p *RemoteTrackPublication) OnRTCP(cb func(rtcp.Packet)) {
 	p.lock.Lock()
 	p.onRTCP = cb
@@ -279,20 +296,27 @@ func (p *RemoteTrackPublication) rtcpWorker() {
 
 type LocalTrackPublication struct {
 	trackPublicationBase
-	sender *webrtc.RTPSender
 	// set for simulcasted tracks
 	simulcastTracks map[livekit.VideoQuality]*LocalTrack
-	opts            TrackPublicationOptions
-	onMuteChanged   func(*LocalTrackPublication, bool)
+	// set for backup codecs
+	backupCodecTrack              TrackLocalWithCodec
+	backupCodecTracksForSimulcast map[livekit.VideoQuality]*LocalTrack
+	backupCodecPublished          atomic.Bool
+
+	opts          TrackPublicationOptions
+	onMuteChanged func(*LocalTrackPublication, bool)
+
+	log protoLogger.Logger
 }
 
-func NewLocalTrackPublication(kind TrackKind, track Track, opts TrackPublicationOptions, engine *RTCEngine) *LocalTrackPublication {
+func NewLocalTrackPublication(kind TrackKind, track Track, opts TrackPublicationOptions, engine *RTCEngine, log protoLogger.Logger) *LocalTrackPublication {
 	pub := &LocalTrackPublication{
 		trackPublicationBase: trackPublicationBase{
 			track:  track,
 			engine: engine,
 		},
 		opts: opts,
+		log:  log,
 	}
 	pub.kind.Store(string(kind))
 	pub.name.Store(opts.Name)
@@ -312,6 +336,14 @@ func (p *LocalTrackPublication) TrackLocal() webrtc.TrackLocal {
 	return nil
 }
 
+func (p *LocalTrackPublication) TrackLocalForSimulcast() []*LocalTrack {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return maps.Values(p.simulcastTracks)
+}
+
+// GetSimulcastTrack returns the simulcast track for a specific quality level.
+// Returns nil if simulcast is not enabled or the quality level doesn't exist.
 func (p *LocalTrackPublication) GetSimulcastTrack(quality livekit.VideoQuality) *LocalTrack {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -321,10 +353,14 @@ func (p *LocalTrackPublication) GetSimulcastTrack(quality livekit.VideoQuality) 
 	return p.simulcastTracks[quality]
 }
 
+// SetMuted mutes or unmutes the track.
+// When muted, no media data will be sent to other participants.
 func (p *LocalTrackPublication) SetMuted(muted bool) {
 	p.setMuted(muted, false)
 }
 
+// SimulateDisconnection simulates a network disconnection for testing purposes.
+// If duration is 0, the disconnection persists until manually reconnected.
 func (p *LocalTrackPublication) SimulateDisconnection(duration time.Duration) {
 	if track := p.track; track != nil {
 		switch t := track.(type) {
@@ -372,15 +408,37 @@ func (p *LocalTrackPublication) addSimulcastTrack(st *LocalTrack) {
 	}
 }
 
-func (p *LocalTrackPublication) setSender(sender *webrtc.RTPSender, consumeRTCP bool) {
+func (p *LocalTrackPublication) setBackupCodecTrack(st TrackLocalWithCodec) {
 	p.lock.Lock()
-	p.sender = sender
-	p.lock.Unlock()
+	defer p.lock.Unlock()
 
-	if !consumeRTCP {
-		return
+	p.backupCodecTrack = st
+}
+
+func (p *LocalTrackPublication) setBackupCodecTracksForSimulcast(st []*LocalTrack) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.backupCodecTracksForSimulcast == nil {
+		p.backupCodecTracksForSimulcast = make(map[livekit.VideoQuality]*LocalTrack)
 	}
+	for _, track := range st {
+		if track != nil {
+			p.backupCodecTracksForSimulcast[track.videoLayer.Quality] = track
+		}
+	}
+}
 
+func (p *LocalTrackPublication) getBackupCodecTrack() (TrackLocalWithCodec, []*LocalTrack) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.backupCodecTrack, maps.Values(p.backupCodecTracksForSimulcast)
+}
+
+func (p *LocalTrackPublication) setBackupCodecPublished() {
+	p.backupCodecPublished.Store(true)
+}
+
+func (p *LocalTrackPublication) readRTCP(sender *webrtc.RTPSender) {
 	// consume RTCP packets so interceptors can handle them (rtt, nacks...)
 	go func() {
 		for {
@@ -393,38 +451,170 @@ func (p *LocalTrackPublication) setSender(sender *webrtc.RTPSender, consumeRTCP 
 	}()
 }
 
+// CloseTrack closes the underlying track and all simulcast tracks.
+// This should be called when the track is no longer needed.
 func (p *LocalTrackPublication) CloseTrack() {
-	for _, st := range p.simulcastTracks {
-		st.Close()
-	}
+	var tracks []LocalTrackWithClose
 
+	p.lock.RLock()
 	if localTrack, ok := p.track.(LocalTrackWithClose); ok {
-		localTrack.Close()
+		tracks = append(tracks, localTrack)
+	}
+
+	for _, st := range p.simulcastTracks {
+		tracks = append(tracks, st)
+	}
+
+	if localTrackWithClose, ok := p.backupCodecTrack.(LocalTrackWithClose); ok {
+		tracks = append(tracks, localTrackWithClose)
+	}
+
+	for _, st := range p.backupCodecTracksForSimulcast {
+		tracks = append(tracks, st)
+	}
+	p.lock.RUnlock()
+
+	for _, track := range tracks {
+		track.Close()
 	}
 }
 
-type SimulcastTrack struct {
-	trackLocal webrtc.TrackLocal
-	videoLayer *livekit.VideoLayer
-}
+// SetPublishingCodecsQuality sets the publishing codecs based on the subscribed codecs quality, return
+// the track(s) to be published for backup codec that is required by subscriber but not published yet.
+func (p *LocalTrackPublication) setPublishingCodecsQuality(subscribedCodecs []*livekit.SubscribedCodec) []string {
+	var codecNeedPub []string
+	for _, subscribedCodec := range subscribedCodecs {
+		if strings.HasSuffix(strings.ToLower(p.MimeType()), subscribedCodec.Codec) {
+			// primary codec
+			for _, subscribedQuality := range subscribedCodec.Qualities {
+				track := p.GetSimulcastTrack(subscribedQuality.Quality)
+				if track != nil {
+					track.setMuted(!subscribedQuality.Enabled)
+					p.log.Infow(
+						"updating layer enable",
+						"trackID", p.SID(),
+						"quality", subscribedQuality.Quality,
+						"enabled", subscribedQuality.Enabled,
+						"codec", subscribedCodec.Codec,
+					)
+				}
+			}
+			continue
+		}
 
-func NewSimulcastTrack(trackLocal webrtc.TrackLocal, videoLayer *livekit.VideoLayer) *SimulcastTrack {
-	return &SimulcastTrack{
-		trackLocal: trackLocal,
-		videoLayer: videoLayer,
+		// backup codec
+		p.lock.RLock()
+		backupCodecTrack, backupCodecTracksForSimulcast := p.backupCodecTrack, p.backupCodecTracksForSimulcast
+		p.lock.RUnlock()
+
+		mainTrack := backupCodecTrack
+		if len(backupCodecTracksForSimulcast) > 0 {
+			mainTrack = maps.Values(backupCodecTracksForSimulcast)[0]
+		}
+		if mainTrack == nil || !strings.HasSuffix(strings.ToLower(mainTrack.Codec().MimeType), subscribedCodec.Codec) {
+			p.log.Warnw("subscriber requested backup codec but no track found", nil, "trackID", p.SID(), "codec", subscribedCodec.Codec)
+			continue
+		}
+
+		// check if need to publish backup codec
+		if !p.backupCodecPublished.Load() {
+			var needPub bool
+			for _, subscribedQuality := range subscribedCodec.Qualities {
+				if subscribedQuality.Enabled {
+					needPub = true
+					break
+				}
+			}
+			if needPub {
+				codecNeedPub = append(codecNeedPub, subscribedCodec.Codec)
+			}
+			continue
+		}
+
+		// dynacast for backup codec simulcast
+		if len(backupCodecTracksForSimulcast) == 0 {
+			continue
+		}
+
+		for _, subscribedQuality := range subscribedCodec.Qualities {
+			track := backupCodecTracksForSimulcast[subscribedQuality.Quality]
+			if track != nil {
+				track.setMuted(!subscribedQuality.Enabled)
+				p.log.Infow(
+					"updating layer enable",
+					"trackID", p.SID(),
+					"quality", subscribedQuality.Quality,
+					"enabled", subscribedQuality.Enabled,
+					"codec", subscribedCodec.Codec,
+				)
+			}
+		}
 	}
+
+	return codecNeedPub
 }
 
-func (t *SimulcastTrack) TrackLocal() webrtc.TrackLocal {
-	return t.trackLocal
+func (p *LocalTrackPublication) setAudioCodecSubscribed(subscribedCodecs []*livekit.SubscribedAudioCodec) []string {
+	var codecNeedPub []string
+	for _, subscribedCodec := range subscribedCodecs {
+		if strings.HasSuffix(strings.ToLower(p.MimeType()), subscribedCodec.Codec) {
+			// primary codec
+			continue
+		}
+
+		// backup codec
+		p.lock.RLock()
+		backupCodecTrack := p.backupCodecTrack
+		p.lock.RUnlock()
+
+		if backupCodecTrack == nil || !strings.HasSuffix(strings.ToLower(backupCodecTrack.Codec().MimeType), subscribedCodec.Codec) {
+			p.log.Warnw("subscriber requested backup codec but no backup codec track found", nil, "trackID", p.SID(), "codec", subscribedCodec.Codec)
+			continue
+		}
+
+		// check if need to publish backup codec
+		if !p.backupCodecPublished.Load() && subscribedCodec.Enabled {
+			codecNeedPub = append(codecNeedPub, subscribedCodec.Codec)
+			continue
+		}
+	}
+
+	return codecNeedPub
 }
 
-func (t *SimulcastTrack) VideoLayer() *livekit.VideoLayer {
-	return t.videoLayer
+func (p *LocalTrackPublication) unpublish(transport *PCTransport) error {
+	var tracks []webrtc.TrackLocal
+	p.lock.RLock()
+
+	if localTrack, ok := p.track.(webrtc.TrackLocal); ok {
+		tracks = append(tracks, localTrack)
+	}
+
+	for _, st := range p.simulcastTracks {
+		tracks = append(tracks, st)
+	}
+
+	tracks = append(tracks, p.backupCodecTrack)
+
+	for _, st := range p.backupCodecTracksForSimulcast {
+		tracks = append(tracks, st)
+	}
+	p.lock.RUnlock()
+
+	for _, sender := range transport.pc.GetSenders() {
+		for _, track := range tracks {
+			if sender.Track() == track {
+				if err := transport.pc.RemoveTrack(sender); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
-func (t *SimulcastTrack) Quality() livekit.VideoQuality {
-	return t.videoLayer.Quality
+func (p *LocalTrackPublication) SetLogger(log protoLogger.Logger) {
+	p.log = log
 }
 
 type TrackPublicationOptions struct {
@@ -440,7 +630,8 @@ type TrackPublicationOptions struct {
 	// if not specified, server will infer it from track source to bundle camera/microphone, screenshare/audio together
 	Stream string
 	// encryption type
-	Encryption livekit.Encryption_Type
+	Encryption        livekit.Encryption_Type
+	BackupCodecPolicy livekit.BackupCodecPolicy
 }
 
 type MuteFunc func(muted bool) error

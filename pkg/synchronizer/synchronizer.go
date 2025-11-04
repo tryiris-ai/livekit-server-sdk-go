@@ -18,19 +18,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/livekit/protocol/utils/mono"
 	"github.com/pion/rtcp"
 )
 
 const (
-	DefaultMaxTsDiff = time.Minute
+	DefaultMaxTsDiff                    = time.Minute
+	DefaultMaxDriftAdjustment           = 5 * time.Millisecond
+	DefaultDriftAdjustmentWindowPercent = 0.0 // 0 -> disables throttling
+	DefaultOldPacketThreshold           = 500 * time.Millisecond
 )
 
 type SynchronizerOption func(*SynchronizerConfig)
 
 // SynchronizerConfig holds configuration for the Synchronizer
 type SynchronizerConfig struct {
-	MaxTsDiff time.Duration
+	MaxTsDiff                         time.Duration
+	MaxDriftAdjustment                time.Duration
+	DriftAdjustmentWindowPercent      float64
+	AudioPTSAdjustmentDisabled        bool
+	PreJitterBufferReceiveTimeEnabled bool
+	RTCPSenderReportRebaseEnabled     bool
+	OldPacketThreshold                time.Duration
+	EnableStartGate                   bool
+
 	OnStarted func()
+
+	MediaRunningTime         func() (time.Duration, bool)
+	MaxMediaRunningTimeDelay time.Duration
 }
 
 // WithMaxTsDiff sets the maximum acceptable difference between RTP packets
@@ -41,10 +56,83 @@ func WithMaxTsDiff(maxTsDiff time.Duration) SynchronizerOption {
 	}
 }
 
+// WithMaxDriftAdjustment sets the maximum drift adjustment applied at a time
+func WithMaxDriftAdjustment(maxDriftAdjustment time.Duration) SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.MaxDriftAdjustment = maxDriftAdjustment
+	}
+}
+
+// WithDriftAdjustmentWinddowPercent controls throttling of how often drift adjustments are applied
+// Throttles PTS adjustment to a limited amount in a time window.
+// This setting determines how long a certain amount of adjustment
+// throttles the next adjustment.
+//
+// For example, if a 1ms adjustment is appied at 1%, it means that
+// 1ms is 1% of ajustment window, so the adjustment window is 100ms
+// and next adjustment will not be applied till that time elapses
+//
+// With the settings of 5ms adjustment at 5%, a mamximum adjustment
+// of 5ms per 100ms
+func WithDriftAdjustmentWindowPercent(driftAdjustmentWindowPercent float64) SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.DriftAdjustmentWindowPercent = driftAdjustmentWindowPercent
+	}
+}
+
+// WithAudioPTSAdjustmentDisabled - disables auto PTS adjustments after sender reports
+// Use case: when media processing pipeline needs stable - monotonically increasing
+// PTS sequence - small adjustments coming from RTCP sender reports could cause gaps in the audio
+// Media processing pipeline could opt out of auto PTS adjustments and handle the gap
+// by e.g modifying tempo to compensate instead
+func WithAudioPTSAdjustmentDisabled() SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.AudioPTSAdjustmentDisabled = true
+	}
+}
+
+// WithPreJitterBufferReceiveTimeEnabled - enables use of packet arrival time before it is
+// added to the jitter buffer
+func WithPreJitterBufferReceiveTimeEnabled() SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.PreJitterBufferReceiveTimeEnabled = true
+	}
+}
+
+// WithRTCPSenderReportRebaseEnabled - enables rebasing RTCP Sender Report to local clock
+func WithRTCPSenderReportRebaseEnabled() SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.RTCPSenderReportRebaseEnabled = true
+	}
+}
+
+// WithOldPacketThreshold sets the threshold at which a packet is considered old
+func WithOldPacketThreshold(oldPacketThreshold time.Duration) SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.OldPacketThreshold = oldPacketThreshold
+	}
+}
+
+// WithStartGate enabled will buffer incoming packets until pacing stabilizes before initializing tracks
+func WithStartGate() SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.EnableStartGate = true
+	}
+}
+
 // WithOnStarted sets the callback to be called when the synchronizer starts
 func WithOnStarted(onStarted func()) SynchronizerOption {
 	return func(config *SynchronizerConfig) {
 		config.OnStarted = onStarted
+	}
+}
+
+// WithMediaRunningTime sets the callback to be called to get the media running time
+// maxMediaRunningTimeDelay is the maximum allowed latency a packet can be behind the media running time
+func WithMediaRunningTime(mediaRunningTime func() (time.Duration, bool), maxMediaRunningTimeDelay time.Duration) SynchronizerOption {
+	return func(config *SynchronizerConfig) {
+		config.MediaRunningTime = mediaRunningTime
+		config.MaxMediaRunningTimeDelay = maxMediaRunningTimeDelay
 	}
 }
 
@@ -60,12 +148,19 @@ type Synchronizer struct {
 	psByIdentity map[string]*participantSynchronizer
 	psBySSRC     map[uint32]*participantSynchronizer
 	ssrcByID     map[string]uint32
+
+	// start time of the external live media (if used, 0 otherwise)
+	externalMediaStartTime time.Time
 }
 
 func NewSynchronizer(onStarted func()) *Synchronizer {
 	config := SynchronizerConfig{
-		MaxTsDiff: DefaultMaxTsDiff,
-		OnStarted: onStarted,
+		MaxTsDiff:                    DefaultMaxTsDiff,
+		MaxDriftAdjustment:           DefaultMaxDriftAdjustment,
+		DriftAdjustmentWindowPercent: DefaultDriftAdjustmentWindowPercent,
+		OldPacketThreshold:           DefaultOldPacketThreshold,
+		OnStarted:                    onStarted,
+		MediaRunningTime:             nil,
 	}
 
 	return &Synchronizer{
@@ -79,8 +174,12 @@ func NewSynchronizer(onStarted func()) *Synchronizer {
 
 func NewSynchronizerWithOptions(opts ...SynchronizerOption) *Synchronizer {
 	config := SynchronizerConfig{
-		MaxTsDiff: DefaultMaxTsDiff,
-		OnStarted: nil,
+		MaxTsDiff:                    DefaultMaxTsDiff,
+		MaxDriftAdjustment:           DefaultMaxDriftAdjustment,
+		DriftAdjustmentWindowPercent: DefaultDriftAdjustmentWindowPercent,
+		OldPacketThreshold:           DefaultOldPacketThreshold,
+		OnStarted:                    nil,
+		MediaRunningTime:             nil,
 	}
 
 	for _, opt := range opts {
@@ -130,7 +229,7 @@ func (s *Synchronizer) RemoveTrack(trackID string) {
 
 	p.Lock()
 	if ts := p.tracks[ssrc]; ts != nil {
-		ts.sync = nil
+		ts.Close()
 	}
 	delete(p.tracks, ssrc)
 	p.Unlock()
@@ -141,6 +240,14 @@ func (s *Synchronizer) GetStartedAt() int64 {
 	defer s.RUnlock()
 
 	return s.startedAt
+}
+
+// SetMediaRunningTime updates the external media running time provider after the synchronizer has been created.
+// Passing a nil provider clears the configuration.
+func (s *Synchronizer) SetMediaRunningTime(mediaRunningTime func() (time.Duration, bool)) {
+	s.Lock()
+	s.config.MediaRunningTime = mediaRunningTime
+	s.Unlock()
 }
 
 func (s *Synchronizer) getOrSetStartedAt(now int64) int64 {
@@ -202,4 +309,31 @@ func (s *Synchronizer) GetEndedAt() int64 {
 	defer s.RUnlock()
 
 	return s.endedAt
+}
+
+func (s *Synchronizer) getExternalMediaDeadline() (time.Duration, bool) {
+	s.RLock()
+	startTime := s.externalMediaStartTime
+	cb := s.config.MediaRunningTime
+	maxDelay := s.config.MaxMediaRunningTimeDelay
+	s.RUnlock()
+
+	now := mono.Now()
+
+	if startTime.IsZero() && cb != nil {
+		if mediaRunningTime, ok := cb(); ok {
+			startTime = now.Add(-mediaRunningTime)
+			s.Lock()
+			if s.externalMediaStartTime.IsZero() {
+				s.externalMediaStartTime = startTime
+			}
+			s.Unlock()
+		}
+	}
+
+	if startTime.IsZero() {
+		return 0, false
+	}
+
+	return now.Sub(startTime) - maxDelay, true
 }

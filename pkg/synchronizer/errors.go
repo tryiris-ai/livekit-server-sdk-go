@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package lksdk
+package synchronizer
 
-const Version = "2.12.7"
+import (
+	"errors"
+)
+
+var (
+	ErrPacketOutOfOrder = errors.New("packet out-of-order")
+	ErrPacketTooOld     = errors.New("packet too old")
+)

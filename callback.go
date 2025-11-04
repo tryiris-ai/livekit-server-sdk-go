@@ -49,6 +49,7 @@ type ParticipantCallback struct {
 	OnTranscriptionReceived   func(transcriptionSegments []*TranscriptionSegment, p Participant, publication TrackPublication)
 }
 
+// NewParticipantCallback creates a new ParticipantCallback with default no-op handlers.
 func NewParticipantCallback() *ParticipantCallback {
 	return &ParticipantCallback{
 		OnLocalTrackPublished:   func(publication *LocalTrackPublication, lp *LocalParticipant) {},
@@ -71,6 +72,7 @@ func NewParticipantCallback() *ParticipantCallback {
 	}
 }
 
+// Merge copies non-nil callback functions from other to this callback.
 func (cb *ParticipantCallback) Merge(other *ParticipantCallback) {
 	if other.OnLocalTrackPublished != nil {
 		cb.OnLocalTrackPublished = other.OnLocalTrackPublished
@@ -135,6 +137,7 @@ const (
 	OtherReason        DisconnectionReason = "other reasons"
 )
 
+// GetDisconnectionReason converts a protocol disconnect reason to a DisconnectionReason.
 func GetDisconnectionReason(reason livekit.DisconnectReason) DisconnectionReason {
 	// TODO: SDK should forward the original reason and provide helpers like IsRequestedLeave.
 	r := OtherReason
@@ -164,6 +167,7 @@ type RoomCallback struct {
 	OnParticipantDisconnected func(*RemoteParticipant)
 	OnActiveSpeakersChanged   func([]Participant)
 	OnRoomMetadataChanged     func(metadata string)
+	OnRecordingStatusChanged  func(isRecording bool)
 	OnRoomMoved               func(roomName string, token string)
 	OnReconnecting            func()
 	OnReconnected             func()
@@ -173,6 +177,7 @@ type RoomCallback struct {
 	ParticipantCallback
 }
 
+// NewRoomCallback creates a new RoomCallback with default no-op handlers.
 func NewRoomCallback() *RoomCallback {
 	pc := NewParticipantCallback()
 	return &RoomCallback{
@@ -184,6 +189,7 @@ func NewRoomCallback() *RoomCallback {
 		OnParticipantDisconnected: func(participant *RemoteParticipant) {},
 		OnActiveSpeakersChanged:   func(participants []Participant) {},
 		OnRoomMetadataChanged:     func(metadata string) {},
+		OnRecordingStatusChanged:  func(isRecording bool) {},
 		OnRoomMoved:               func(roomName string, token string) {},
 		OnReconnecting:            func() {},
 		OnReconnected:             func() {},
@@ -191,6 +197,7 @@ func NewRoomCallback() *RoomCallback {
 	}
 }
 
+// Merge copies non-nil callback functions from other to this callback.
 func (cb *RoomCallback) Merge(other *RoomCallback) {
 	if other == nil {
 		return
@@ -213,6 +220,9 @@ func (cb *RoomCallback) Merge(other *RoomCallback) {
 	}
 	if other.OnRoomMetadataChanged != nil {
 		cb.OnRoomMetadataChanged = other.OnRoomMetadataChanged
+	}
+	if other.OnRecordingStatusChanged != nil {
+		cb.OnRecordingStatusChanged = other.OnRecordingStatusChanged
 	}
 	if other.OnReconnecting != nil {
 		cb.OnReconnecting = other.OnReconnecting

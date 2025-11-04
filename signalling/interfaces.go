@@ -83,6 +83,9 @@ type ConnectParams struct {
 	Interceptors []interceptor.Factory
 
 	ICETransportPolicy webrtc.ICETransportPolicy
+
+	// internal use
+	Codecs []webrtc.RTPCodecParameters
 }
 
 type SignalTransport interface {
@@ -121,8 +124,8 @@ type SignalHandler interface {
 type SignalProcessor interface {
 	OnJoinResponse(joinResponse *livekit.JoinResponse) error
 	OnReconnectResponse(reconnectResponse *livekit.ReconnectResponse) error
-	OnAnswer(sd webrtc.SessionDescription, answerId uint32)
-	OnOffer(sd webrtc.SessionDescription, offerId uint32)
+	OnAnswer(sd webrtc.SessionDescription, answerId uint32, midToTrackID map[string]string)
+	OnOffer(sd webrtc.SessionDescription, offerId uint32, midToTrackID map[string]string)
 	OnTrickle(init webrtc.ICECandidateInit, target livekit.SignalTarget)
 	OnParticipantUpdate([]*livekit.ParticipantInfo)
 	OnLocalTrackPublished(response *livekit.TrackPublishedResponse)
@@ -136,5 +139,6 @@ type SignalProcessor interface {
 	OnLeave(*livekit.LeaveRequest)
 	OnLocalTrackSubscribed(trackSubscribed *livekit.TrackSubscribed)
 	OnSubscribedQualityUpdate(subscribedQualityUpdate *livekit.SubscribedQualityUpdate)
+	OnSubscribedAudioCodecUpdate(subscribedAudioCodecUpdate *livekit.SubscribedAudioCodecUpdate)
 	OnMediaSectionsRequirement(mediaSectionsRequirement *livekit.MediaSectionsRequirement)
 }
