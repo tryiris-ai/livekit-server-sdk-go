@@ -215,7 +215,6 @@ func NewPCTransport(params PCTransportParams) (*PCTransport, error) {
 		}
 	} else {
 		profiles = append(profiles, dtls.SRTP_AEAD_AES_128_GCM)
-		profiles = append(profiles, dtls.SRTP_AES128_CM_HMAC_SHA1_80)
 	}
 
 	slog.Info("SRTP Protection Profiles: ", "profiles", profiles)
