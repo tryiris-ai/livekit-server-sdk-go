@@ -844,19 +844,19 @@ func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.Data
 		return errors.New("datachannel not found")
 	}
 
-	if e.connParams.MaxDataChannelBuffer > 0 {
-		if dc.BufferedAmount() >= e.connParams.MaxDataChannelBuffer {
-			e.log.Warnw("DataChannel buffer full, discarding message", nil, "maxBufferSize", e.connParams.MaxDataChannelBuffer)
-			return errors.New("datachannel buffer full")
-		}
-	}
-
 	if kind == livekit.DataPacket_RELIABLE {
 		e.reliableMsgLock.Lock()
 		defer e.reliableMsgLock.Unlock()
 
 		pck.Sequence = e.reliableMsgSeq
 		e.reliableMsgSeq++
+	}
+
+	if e.connParams.MaxDataChannelBuffer > 0 {
+		if dc.BufferedAmount() >= e.connParams.MaxDataChannelBuffer {
+			e.log.Warnw("DataChannel buffer full, discarding message", nil, "maxBufferSize", e.connParams.MaxDataChannelBuffer)
+			return errors.New("datachannel buffer full")
+		}
 	}
 
 	data, err := proto.Marshal(pck)

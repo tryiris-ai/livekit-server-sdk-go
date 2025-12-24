@@ -115,7 +115,8 @@ func WithRetransmitBufferSize(val uint16) ConnectOption {
 	}
 }
 
-// WithMaxDataChannelBuffer sets the maximum buffer size for data channels. Any data exceeding this size will be dropped.
+// WithMaxDataChannelBuffer sets the maximum amount of buffered (unsent) data for data channels.
+// When the buffered data reaches this limit, new messages will be dropped until space becomes available.
 func WithMaxDataChannelBuffer(size uint64) ConnectOption {
 	return func(p *signalling.ConnectParams) {
 		p.MaxDataChannelBuffer = size
