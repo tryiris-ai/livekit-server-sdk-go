@@ -854,7 +854,7 @@ func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.Data
 
 	if e.connParams.MaxDataChannelBuffer > 0 {
 		if dc.BufferedAmount() >= e.connParams.MaxDataChannelBuffer {
-			e.log.Warnw("DataChannel buffer full, discarding message", nil, "maxBufferSize", e.connParams.MaxDataChannelBuffer)
+			e.log.Warnw("DataChannel buffer full, dropping message", nil, "maxBufferSize", e.connParams.MaxDataChannelBuffer)
 			return errors.New("datachannel buffer full")
 		}
 	}
