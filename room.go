@@ -115,6 +115,13 @@ func WithRetransmitBufferSize(val uint16) ConnectOption {
 	}
 }
 
+// WithMaxDataChannelBuffer sets the maximum buffer size for data channels. Any data exceeding this size will be dropped.
+func WithMaxDataChannelBuffer(size uint64) ConnectOption {
+	return func(p *signalling.ConnectParams) {
+		p.MaxDataChannelBuffer = size
+	}
+}
+
 // WithPacer enables the use of a pacer on this connection
 // A pacer helps to smooth out video packet rate to avoid overwhelming downstream. Learn more at: https://chromium.googlesource.com/external/webrtc/+/master/modules/pacing/g3doc/index.md
 func WithPacer(pacer pacer.Factory) ConnectOption {
