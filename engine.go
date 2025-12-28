@@ -398,12 +398,10 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 	trueVal := true
 	falseVal := false
 	maxRetries := uint16(1)
-	// maxLiftime := uint16(50000)
 	e.dclock.Lock()
 	e.lossyDC, err = e.publisher.pc.CreateDataChannel(lossyDataChannelName, &webrtc.DataChannelInit{
 		Ordered:        &falseVal,
 		MaxRetransmits: &maxRetries,
-		// MaxPacketLifeTime: &maxLiftime,
 	})
 	if err != nil {
 		e.dclock.Unlock()
@@ -411,11 +409,8 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 	}
 	e.lossyDC.OnMessage(e.handleDataPacket)
 
-	maxRetries = 10
 	e.reliableDC, err = e.publisher.pc.CreateDataChannel(reliableDataChannelName, &webrtc.DataChannelInit{
 		Ordered: &trueVal,
-		// MaxRetransmits:    &maxRetries,
-		// MaxPacketLifeTime: &maxLiftime,
 	})
 	if err != nil {
 		e.dclock.Unlock()
