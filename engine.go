@@ -398,10 +398,12 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 	trueVal := true
 	falseVal := false
 	maxRetries := uint16(1)
+	// maxLiftime := uint16(50000)
 	e.dclock.Lock()
 	e.lossyDC, err = e.publisher.pc.CreateDataChannel(lossyDataChannelName, &webrtc.DataChannelInit{
 		Ordered:        &falseVal,
 		MaxRetransmits: &maxRetries,
+		// MaxPacketLifeTime: &maxLiftime,
 	})
 	if err != nil {
 		e.dclock.Unlock()
@@ -409,8 +411,11 @@ func (e *RTCEngine) createPublisherPCLocked(configuration webrtc.Configuration) 
 	}
 	e.lossyDC.OnMessage(e.handleDataPacket)
 
+	maxRetries = 10
 	e.reliableDC, err = e.publisher.pc.CreateDataChannel(reliableDataChannelName, &webrtc.DataChannelInit{
 		Ordered: &trueVal,
+		// MaxRetransmits:    &maxRetries,
+		// MaxPacketLifeTime: &maxLiftime,
 	})
 	if err != nil {
 		e.dclock.Unlock()
@@ -847,16 +852,20 @@ func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.Data
 	if kind == livekit.DataPacket_RELIABLE {
 		e.reliableMsgLock.Lock()
 		defer e.reliableMsgLock.Unlock()
-
-		pck.Sequence = e.reliableMsgSeq
-		e.reliableMsgSeq++
 	}
 
 	if e.connParams.MaxDataChannelBuffer > 0 {
-		if dc.BufferedAmount() >= e.connParams.MaxDataChannelBuffer {
+		// SCTP().BufferedAmount includes data from all data channels but sometimes some data can be accumulated
+		// on the specific data channel prior to sending. So we add both amounts to be safe.
+		if uint64(e.publisher.pc.SCTP().BufferedAmount())+dc.BufferedAmount() > e.connParams.MaxDataChannelBuffer {
 			e.log.Warnw("DataChannel buffer full, dropping message", nil, "maxBufferSize", e.connParams.MaxDataChannelBuffer)
 			return errors.New("datachannel buffer full")
 		}
+	}
+
+	if kind == livekit.DataPacket_RELIABLE {
+		pck.Sequence = e.reliableMsgSeq
+		e.reliableMsgSeq++
 	}
 
 	data, err := proto.Marshal(pck)
