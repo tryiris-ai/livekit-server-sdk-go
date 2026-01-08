@@ -847,7 +847,23 @@ func (e *RTCEngine) publishDataPacket(pck *livekit.DataPacket, kind livekit.Data
 	if kind == livekit.DataPacket_RELIABLE {
 		e.reliableMsgLock.Lock()
 		defer e.reliableMsgLock.Unlock()
+	}
 
+	if e.connParams.MaxDataChannelBuffer > 0 {
+		// SCTP().BufferedAmount includes data from all data channels but sometimes some data can be accumulated
+		// on the specific data channel prior to sending. So we add both amounts to be safe.
+		sctp := e.publisher.pc.SCTP()
+		var sctpBuffered uint64
+		if sctp != nil {
+			sctpBuffered = uint64(sctp.BufferedAmount())
+		}
+		if sctpBuffered+dc.BufferedAmount() > e.connParams.MaxDataChannelBuffer {
+			e.log.Warnw("DataChannel buffer full, dropping message", nil, "maxBufferSize", e.connParams.MaxDataChannelBuffer)
+			return errors.New("datachannel buffer full")
+		}
+	}
+
+	if kind == livekit.DataPacket_RELIABLE {
 		pck.Sequence = e.reliableMsgSeq
 		e.reliableMsgSeq++
 	}

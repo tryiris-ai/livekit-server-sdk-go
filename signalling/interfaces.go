@@ -74,6 +74,8 @@ type ConnectParams struct {
 
 	RetransmitBufferSize uint16
 
+	MaxDataChannelBuffer uint64
+
 	Metadata string // See WithMetadata
 
 	Attributes map[string]string // See WithExtraAttributes
